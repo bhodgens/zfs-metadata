@@ -482,6 +482,15 @@ zfsctl_is_snapdir(struct inode *ip)
 }
 
 /*
+ * Check if the given inode is a .zfs/events directory.
+ */
+boolean_t
+zfsctl_is_eventsdir(struct inode *ip)
+{
+	return (zfsctl_is_node(ip) && (ip->i_ino == ZFSCTL_INO_EVENTSDIR));
+}
+
+/*
  * Allocate a new inode with the passed id and ops.
  */
 static struct inode *
@@ -831,6 +840,9 @@ zfsctl_root_lookup(struct inode *dip, const char *name, struct inode **ipp,
 	} else if (strcmp(name, ZFS_SHAREDIR_NAME) == 0) {
 		*ipp = zfsctl_inode_lookup(zfsvfs, ZFSCTL_INO_SHARES,
 		    &zpl_fops_shares, &zpl_ops_shares);
+	} else if (strcmp(name, ZFS_EVENTSDIR_NAME) == 0) {
+		*ipp = zfsctl_inode_lookup(zfsvfs, ZFSCTL_INO_EVENTSDIR,
+		    &zpl_fops_events, &zpl_ops_events);
 	} else {
 		*ipp = NULL;
 	}

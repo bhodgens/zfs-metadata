@@ -112,6 +112,9 @@ extern const struct inode_operations zpl_ops_snapdir;
 extern const struct file_operations zpl_fops_shares;
 extern const struct inode_operations zpl_ops_shares;
 
+extern const struct file_operations zpl_fops_events;
+extern const struct inode_operations zpl_ops_events;
+
 /* zpl_file_range.c */
 
 /* handlers for file_operations of the same name */
