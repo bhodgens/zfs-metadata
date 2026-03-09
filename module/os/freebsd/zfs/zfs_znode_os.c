@@ -59,6 +59,7 @@
 #include <sys/stat.h>
 #include <sys/zap.h>
 #include <sys/zfs_znode.h>
+#include <sys/zfs_events.h>
 #include <sys/sa.h>
 #include <sys/zfs_sa.h>
 #include <sys/zfs_stat.h>
@@ -1625,6 +1626,7 @@ zfs_freesp(znode_t *zp, uint64_t off, uint64_t len, int flag, boolean_t log)
 	zilog_t *zilog = zfsvfs->z_log;
 	uint64_t mode;
 	uint64_t mtime[2], ctime[2];
+	uint64_t old_size = zp->z_size;
 	sa_bulk_attr_t bulk[3];
 	int count = 0;
 	int error;
@@ -1669,6 +1671,10 @@ log:
 	ASSERT0(error);
 
 	zfs_log_truncate(zilog, tx, TX_TRUNCATE, zp, off, len);
+	if (zfsvfs->z_events) {
+		zfs_events_log_truncate(zfsvfs->z_os, tx, zp->z_id,
+		    old_size, off);
+	}
 
 	dmu_tx_commit(tx);
 	return (0);
