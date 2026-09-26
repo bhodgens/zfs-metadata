@@ -784,7 +784,8 @@ top:
 		if (zfsvfs->z_events) {
 			zfs_events_log_create(os, tx, zp->z_id, dzp->z_id,
 			    name, vap->va_mode, crgetuid(cr), crgetgid(cr),
-			    zfsvfs->z_events_size, &zfsvfs->z_events_obj);
+			    zfsvfs->z_events_size, &zfsvfs->z_events_obj,
+			    &zfsvfs->z_events_lock);
 		}
 		zfs_acl_ids_free(&acl_ids);
 		dmu_tx_commit(tx);
@@ -1196,7 +1197,8 @@ top:
 	zfs_log_remove(zilog, tx, txtype, dzp, name, obj, unlinked);
 	if (zfsvfs->z_events) {
 		zfs_events_log_remove(zfsvfs->z_os, tx, obj, dzp->z_id, name,
-		    zfsvfs->z_events_size, &zfsvfs->z_events_obj);
+		    zfsvfs->z_events_size, &zfsvfs->z_events_obj,
+		    &zfsvfs->z_events_lock);
 	}
 
 	dmu_tx_commit(tx);
@@ -1404,7 +1406,8 @@ top:
 	if (zfsvfs->z_events) {
 		zfs_events_log_create(zfsvfs->z_os, tx, zp->z_id, dzp->z_id,
 		    dirname, vap->va_mode, uid, gid, zfsvfs->z_events_size,
-		    &zfsvfs->z_events_obj);
+		    &zfsvfs->z_events_obj,
+		    &zfsvfs->z_events_lock);
 	}
 
 out:
@@ -1543,7 +1546,8 @@ top:
 		if (zfsvfs->z_events) {
 			zfs_events_log_remove(zfsvfs->z_os, tx, zp->z_id,
 			    dzp->z_id, name, zfsvfs->z_events_size,
-			    &zfsvfs->z_events_obj);
+			    &zfsvfs->z_events_obj,
+			    &zfsvfs->z_events_lock);
 		}
 	}
 
@@ -2618,7 +2622,8 @@ top:
 		if (zfsvfs->z_events) {
 			zfs_events_log_setattr(zfsvfs->z_os, tx, zp->z_id,
 			    mask, zfsvfs->z_events_size,
-			    &zfsvfs->z_events_obj);
+			    &zfsvfs->z_events_obj,
+			    &zfsvfs->z_events_lock);
 		}
 		/*
 		 * Ensure that the z_seq is always incremented on setattr
@@ -3255,7 +3260,8 @@ top:
 	if (zfsvfs->z_events) {
 		zfs_events_log_rename(zfsvfs->z_os, tx, szp->z_id,
 		    sdzp->z_id, sdl->dl_name, tdzp->z_id, tdl->dl_name,
-		    zfsvfs->z_events_size, &zfsvfs->z_events_obj);
+		    zfsvfs->z_events_size, &zfsvfs->z_events_obj,
+		    &zfsvfs->z_events_lock);
 	}
 
 commit:
@@ -3479,7 +3485,8 @@ top:
 		if (zfsvfs->z_events) {
 			zfs_events_log_symlink(zfsvfs->z_os, tx, zp->z_id,
 			    dzp->z_id, name, link, zfsvfs->z_events_size,
-			    &zfsvfs->z_events_obj);
+			    &zfsvfs->z_events_obj,
+			    &zfsvfs->z_events_lock);
 		}
 
 		zfs_znode_update_vfs(dzp);
@@ -3727,7 +3734,8 @@ top:
 				zfs_events_log_link(zfsvfs->z_os, tx,
 				    szp->z_id, tdzp->z_id, name,
 				    zfsvfs->z_events_size,
-				    &zfsvfs->z_events_obj);
+				    &zfsvfs->z_events_obj,
+				    &zfsvfs->z_events_lock);
 			}
 		}
 	} else if (is_tmpfile) {
