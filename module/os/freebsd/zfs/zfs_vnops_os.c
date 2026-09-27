@@ -1146,7 +1146,7 @@ zfs_create(znode_t *dzp, const char *name, vattr_t *vap, int excl, int mode,
 		    0, acl_ids.z_aclp->z_acl_bytes);
 	}
 	if (zfsvfs->z_events)
-		zfs_events_txhold(os, zfsvfs->z_events_size, tx);
+		zfs_events_txhold(os, tx);
 	error = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (error) {
 		zfs_acl_ids_free(&acl_ids);
@@ -1290,7 +1290,7 @@ zfs_remove_(vnode_t *dvp, vnode_t *vp, const char *name, cred_t *cr)
 	/* charge as an update -- would be nice not to charge at all */
 	dmu_tx_hold_zap(tx, zfsvfs->z_unlinkedobj, FALSE, NULL);
 	if (zfsvfs->z_events)
-		zfs_events_txhold(zfsvfs->z_os, zfsvfs->z_events_size, tx);
+		zfs_events_txhold(zfsvfs->z_os, tx);
 
 	/*
 	 * Mark this transaction as typically resulting in a net free of space
@@ -1524,7 +1524,7 @@ zfs_mkdir(znode_t *dzp, const char *dirname, vattr_t *vap, znode_t **zpp,
 	dmu_tx_hold_sa_create(tx, acl_ids.z_aclp->z_acl_bytes +
 	    ZFS_SA_BASE_ATTR_SIZE);
 	if (zfsvfs->z_events)
-		zfs_events_txhold(zfsvfs->z_os, zfsvfs->z_events_size, tx);
+		zfs_events_txhold(zfsvfs->z_os, tx);
 
 	error = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (error) {
@@ -1634,7 +1634,7 @@ zfs_rmdir_(vnode_t *dvp, vnode_t *vp, const char *name, cred_t *cr)
 	zfs_sa_upgrade_txholds(tx, zp);
 	zfs_sa_upgrade_txholds(tx, dzp);
 	if (zfsvfs->z_events)
-		zfs_events_txhold(zfsvfs->z_os, zfsvfs->z_events_size, tx);
+		zfs_events_txhold(zfsvfs->z_os, tx);
 	dmu_tx_mark_netfree(tx);
 	error = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (error) {
@@ -2806,7 +2806,7 @@ zfs_setattr(znode_t *zp, vattr_t *vap, int flags, cred_t *cr, zidmap_t *mnt_ns)
 
 	zfs_sa_upgrade_txholds(tx, zp);
 	if (zfsvfs->z_events)
-		zfs_events_txhold(zfsvfs->z_os, zfsvfs->z_events_size, tx);
+		zfs_events_txhold(zfsvfs->z_os, tx);
 
 	err = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (err)
@@ -3521,7 +3521,7 @@ zfs_do_rename_impl(vnode_t *sdvp, vnode_t **svpp, struct componentname *scnp,
 	zfs_sa_upgrade_txholds(tx, szp);
 	dmu_tx_hold_zap(tx, zfsvfs->z_unlinkedobj, FALSE, NULL);
 	if (zfsvfs->z_events)
-		zfs_events_txhold(zfsvfs->z_os, zfsvfs->z_events_size, tx);
+		zfs_events_txhold(zfsvfs->z_os, tx);
 	error = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (error) {
 		dmu_tx_abort(tx);
@@ -3731,7 +3731,7 @@ zfs_symlink(znode_t *dzp, const char *name, vattr_t *vap,
 	if (fuid_dirtied)
 		zfs_fuid_txhold(zfsvfs, tx);
 	if (zfsvfs->z_events)
-		zfs_events_txhold(zfsvfs->z_os, zfsvfs->z_events_size, tx);
+		zfs_events_txhold(zfsvfs->z_os, tx);
 	error = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (error) {
 		zfs_acl_ids_free(&acl_ids);
@@ -3958,7 +3958,7 @@ zfs_link(znode_t *tdzp, znode_t *szp, const char *name, cred_t *cr,
 	zfs_sa_upgrade_txholds(tx, szp);
 	zfs_sa_upgrade_txholds(tx, tdzp);
 	if (zfsvfs->z_events)
-		zfs_events_txhold(zfsvfs->z_os, zfsvfs->z_events_size, tx);
+		zfs_events_txhold(zfsvfs->z_os, tx);
 	error = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (error) {
 		dmu_tx_abort(tx);
