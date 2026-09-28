@@ -8541,7 +8541,6 @@ zfs_do_events(int argc, char **argv)
 	 * until the log is exhausted so a large log is never silently
 	 * truncated.
 	 */
-	nvlist_t *events = NULL;
 	uint64_t next_offset = 0;
 	uint64_t prev_offset = 0;
 	uint64_t lost_total = 0;
@@ -8552,6 +8551,7 @@ zfs_do_events(int argc, char **argv)
 
 	for (;;) {
 		nvlist_t *page = NULL;
+		nvlist_t *events;
 
 		error = lzc_get_events(zfs_get_name(zhp), object_filter,
 		    next_offset, &page);
@@ -8559,8 +8559,10 @@ zfs_do_events(int argc, char **argv)
 			break;
 
 		/* Guard against a page that makes no forward progress. */
-		if (count > 0 && next_offset == prev_offset)
+		if (count > 0 && next_offset == prev_offset) {
+			nvlist_free(page);
 			break;
+		}
 		prev_offset = next_offset;
 
 		if (!header_printed) {
@@ -8584,8 +8586,6 @@ zfs_do_events(int argc, char **argv)
 			have_lost = B_TRUE;
 		}
 
-		nvlist_free(events);
-		events = NULL;
 		if (nvlist_lookup_nvlist(page, "events", &events) != 0) {
 			nvlist_free(page);
 			break;
@@ -8654,7 +8654,6 @@ zfs_do_events(int argc, char **argv)
 		    (u_longlong_t)lost_total);
 	}
 
-	nvlist_free(events);
 	zfs_close(zhp);
 	return (ret);
 }
