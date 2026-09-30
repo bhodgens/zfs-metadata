@@ -190,6 +190,8 @@ zfs_znode_init(void)
 	znode_hold_cache = kmem_cache_create("zfs_znode_hold_cache",
 	    sizeof (znode_hold_t), 0, zfs_znode_hold_cache_constructor,
 	    zfs_znode_hold_cache_destructor, NULL, NULL, NULL, 0);
+
+	zfs_events_qent_init();
 }
 
 void
@@ -205,6 +207,8 @@ zfs_znode_fini(void)
 	if (znode_hold_cache)
 		kmem_cache_destroy(znode_hold_cache);
 	znode_hold_cache = NULL;
+
+	zfs_events_qent_fini();
 }
 
 /*
