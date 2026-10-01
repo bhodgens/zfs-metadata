@@ -46,6 +46,7 @@
 #include <sys/zfs_events.h>
 #include <sys/zfs_vnops.h>
 #include <sys/zfs_dir.h>
+#include <sys/zfs_events.h>
 #include <sys/zil.h>
 #include <sys/fs/zfs.h>
 #include <sys/dmu.h>
@@ -1244,6 +1245,7 @@ zfsvfs_free(zfsvfs_t *zfsvfs)
 
 	zfs_fuid_destroy(zfsvfs);
 
+	list_destroy(&zfsvfs->z_evq_deferred);
 	mutex_destroy(&zfsvfs->z_znodes_lock);
 	mutex_destroy(&zfsvfs->z_lock);
 	mutex_destroy(&zfsvfs->z_events_lock);
