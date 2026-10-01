@@ -1973,6 +1973,21 @@ zfs_clone_range(znode_t *inzp, uint64_t *inoffp, znode_t *outzp,
 		zfs_log_clone_range(zilog, tx, TX_CLONE_RANGE, outzp, outoff,
 		    size, inblksz, bps, nbps);
 
+		/*
+		 * A clone writes the destination without going through
+		 * zfs_write(). Flush any pending window and record the
+		 * cloned range so the audit log is not a hole.
+		 */
+		zfs_events_io_flush(outzp, outos, tx, B_TRUE);
+		zfs_events_io_flush(outzp, outos, tx, B_FALSE);
+		if (outzfsvfs->z_events) {
+			zfs_events_log_write(outos, tx, outzp->z_id,
+			    outoff, size, cr, outzfsvfs->z_events_size,
+			    &outzfsvfs->z_events_obj,
+			    &outzfsvfs->z_events_lock,
+			    dmu_tx_get_txg(tx));
+		}
+
 		dmu_tx_commit(tx);
 
 		if (error != 0)
