@@ -4,7 +4,7 @@ This document is the stable contract between the `zmetad` daemon's SQLite
 database (`zmetad.db`) and external consumers (e.g. zeta-object). It is
 written so a consumer can be implemented without reading `zmetad` source.
 Every column name, type, and semantic below is pinned to
-`contrib/zmetad/zmetad_db.c` at DB layout version 3.
+`contrib/zmetad/zmetad_db.c` at DB layout version 5.
 
 The database is opened in WAL mode (`PRAGMA journal_mode=WAL`); consumers
 may read concurrently with the daemon.
@@ -51,7 +51,7 @@ migration logic.
 
 Two version keys live in `meta` and are independent:
 
-- `db_schema_version` — the SQLite layout version (this document; `3`).
+- `db_schema_version` — the SQLite layout version (this document; `5`).
 - `events_schema_version` — the wire record schema version (`2`, see
   `contrib/zmetad/events-schema.json`). zmetad refuses to open a
   database whose stored wire version differs from its loaded schema;
@@ -100,25 +100,37 @@ outside the enum decode as `UNKNOWN`):
 `NONE`, `CREATE`, `REMOVE`, `RENAME`, `LINK`, `SYMLINK`, `TRUNCATE`,
 `SETATTR`, `WRITE`, `READ`
 
-Op-constrained optional columns (per events-schema.json ops lists and
-the daemon's binds):
+Op-constrained optional columns. **What the wire actually carries**
+(verified against the kernel emitters in `module/zfs/zfs_events.c` and
+the daemon's binds): name-bearing ops (`CREATE`, `REMOVE`, `RENAME`,
+`LINK`, `SYMLINK`) send `name`/`parent`; the size/attr/IO ops
+(`TRUNCATE`, `SETATTR`, `WRITE`, `READ`) do **not** — their records
+carry no `name` and no `parent`, so `path`, `parent`, and (except
+where noted) `size` are NULL for those rows:
 
 | Op | Columns populated beyond the always-present four |
 |----------|--------------------------------------------------|
-| CREATE | `path`, `parent` |
+| CREATE | `path`, `parent`, `mode`*, `uid`, `gid` |
 | REMOVE | `path`, `parent` |
 | RENAME | `path`, `parent`, `old_path`, `old_parent` |
 | LINK | `path`, `parent` |
 | SYMLINK | `path`, `parent`, `target` |
-| TRUNCATE | `path`, `parent`, `size` (new), `old_size` |
-| SETATTR | `path`, `parent`, `size` (new), `attrs` |
-| WRITE | `path`, `parent`, `io_offset`, `io_bytes` |
-| READ | `path`, `parent`, `io_offset`, `io_bytes` |
+| TRUNCATE | `old_size`, `size` (from wire `new_size`) |
+| SETATTR | `attrs` |
+| WRITE | `io_offset`, `io_bytes`, `uid`, `gid` |
+| READ | `io_offset`, `io_bytes`, `uid`, `gid` |
+
+\* `mode` arrives on the CREATE wire record but is not bound to the
+column (kept NULL for schema stability; see the `events` table note).
 
 (`uid`, `gid` are optional fields not bound to a specific op: they are
-populated whenever the record carries them. WRITE/READ exist only when
-`events_io` is enabled and are coalesced by the `events_io_window`
-fence — `io_offset` is the window's first offset, `io_bytes` the summed
+populated whenever the record carries them — in practice CREATE and
+WRITE/READ. Consumers MUST NOT expect `path`, `parent`, or `size` on
+TRUNCATE/SETATTR/WRITE/READ rows: identify those events by
+`object_id`, resolving the object to a name from the dataset's
+CREATE/RENAME history. WRITE/READ exist only when `events_io` is
+enabled and are coalesced by the `events_io_window` fence —
+`io_offset` is the window's first offset, `io_bytes` the summed
 total.)
 
 The four always-present columns are `txg`, `timestamp` (`time`),
@@ -294,23 +306,28 @@ To reconstruct path state per dataset:
 ## 8. Freshness (#5)
 
 The database lags live filesystem state by at most one poll interval
-(default 30 seconds; `--poll`, minimum 1). `SIGUSR1` forces an
+(default 30 seconds; `-i`/`--interval`, minimum 1). `SIGUSR1` forces an
 immediate out-of-band collect, after which the database is current as of
 that collect. See zmetad(8) for CLI details.
 
 
 ## 9. Operational facts
 
-- **Retention** (`--retention <days>`, default 90; 0 disables): deletes
-  `events` rows with `captured_at` older than the cutoff, then runs
-  `VACUUM`. **Scope is events only** — `gaps`, `sync_state`, and
-  `datasets` are untouched, which is what makes the gap counts in
-  Section 4 lifetime figures.
+- **Retention** (`-r`/`--retention <days>`, default 90; must be
+  1..36500 — zero, negative, and non-numeric values are rejected):
+  deletes `events` rows whose `captured_at` is older than the cutoff,
+  then runs `VACUUM`. Rows with a **NULL `captured_at`** (pre-v4
+  rows) are **never deleted** by retention, regardless of age.
+  **Scope is events only** — `gaps`, `sync_state`, and `datasets` are
+  untouched, which is what makes the gap counts in Section 4
+  lifetime figures.
 - **`zmetad --purge <dataset>`** (one-shot mode: no daemonize, no poll
   loop): deletes the dataset's rows from `events`, `gaps`, and
-  `sync_state` (reported counts in that order), then clears the
-  dataset's in-kernel event ring. This is the **only** mechanism that
-  removes `gaps` rows. The `datasets` mapping row is left in place.
+  `sync_state`, then clears the dataset's in-kernel event ring. Its
+  report line prints the **events and gaps counts only** (`purged
+  <ds>: N events, M gaps removed; kernel ring cleared`). This is the
+  **only** mechanism that removes `gaps` rows. The `datasets` mapping
+  row is left in place.
 - **Poll loop**: collects every `poll_interval` seconds (1-second sleep
   granularity); each poll persists the watermark + ring GUID, appends
   new events (dedup as in Section 3), refreshes the `datasets`

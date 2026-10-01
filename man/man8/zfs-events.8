@@ -15,7 +15,7 @@
 .\"
 .\" Copyright (c) 2026, OpenZFS Contributors. All rights reserved.
 .\"
-.Dd September 29, 2026
+.Dd October 1, 2026
 .Dt ZFS-EVENTS 8
 .Os
 .
@@ -25,10 +25,13 @@
 .Sh SYNOPSIS
 .Nm zfs
 .Cm events
-.Op Fl jHp
+.Op Fl c
+.Ar filesystem Ns | Ns Ar volume
+.Nm zfs
+.Cm events
+.Op Fl j
 .Op Fl n Ar count
 .Op Fl o Ar object
-.Op Fl t Ar @snapshot Ns Op Ar ..@snapshot
 .Ar filesystem Ns | Ns Ar volume
 .Op Ar path
 .
@@ -56,6 +59,11 @@ The
 .Sy events
 property is inheritable, so enabling it on a parent dataset will enable
 event logging for all descendant datasets.
+.Pp
+Event logs are per-dataset and are not part of a snapshot's data:
+arguments containing a snapshot delimiter
+.Pq Sq @
+are rejected.
 .
 .Ss Event Types
 The following event types are recorded:
@@ -65,7 +73,7 @@ File or directory created
 .It Sy REMOVE
 File or directory deleted
 .It Sy RENAME
-File or directory renamed (includes old and new paths)
+File or directory renamed (includes old and new names)
 .It Sy LINK
 Hard link created
 .It Sy SYMLINK
@@ -190,21 +198,36 @@ per window period.
 .El
 .
 .Sh OPTIONS
-.Bl -tag -width "-t @snap..@snap"
+.Bl -tag -width "-o object"
+.It Fl c
+Clear the dataset's event log instead of displaying it, then exit.
+The dataset must be mounted.
+.Fl c
+cannot be combined with
+.Fl j ,
+.Fl n ,
+.Fl o ,
+or a
+.Ar path
+argument.
+Clearing preserves ring identity: consumers tracking the ring GUID
+(e.g.\&
+.Xr zmetad 8 )
+see the same ring instance, reset to empty.
 .It Fl j
 Output in JSON format for machine parsing.
-Each event is printed as a separate JSON object on its own line.
-.It Fl H
-Scripted mode: do not print headers and separate fields by a single tab
-instead of arbitrary whitespace.
-.It Fl p
-Display numbers in exact (parsable) values rather than human-readable form.
-Timestamps are shown as Unix epoch seconds.
+All events are printed as a single JSON array; each event is one
+object on its own line.
+See
+.Sx OUTPUT
+for the exact key set.
 .It Fl n Ar count
-Limit output to the most recent
+Limit output to the oldest
 .Ar count
-events.
+events in the ring buffer.
 By default, all events in the ring buffer are displayed.
+.Ar count
+must be a positive integer; zero and non-numeric values are rejected.
 .It Fl o Ar object
 Display only events for the specified ZFS object ID.
 Object IDs can be obtained from
@@ -212,99 +235,139 @@ Object IDs can be obtained from
 or from previous
 .Nm zfs Cm events
 output.
-.It Fl t Ar @snapshot Ns Op Ar ..@snapshot
-Display events relative to snapshots.
-With a single snapshot, display events that occurred after that snapshot.
-With a range
-.Ar @snap1..@snap2 ,
-display events between the two snapshots.
+The value must be numeric.
 .It Ar filesystem Ns | Ns Ar volume
 The dataset to query for events.
 .It Ar path
-Optional path to filter events.
-Only events affecting the specified file or directory will be shown.
-For renamed files, events are matched against both old and new paths.
+Optional dataset-relative path used to filter events.
+The path is resolved against the dataset's mountpoint and converted
+to an object ID, so the query shows the full history of that object,
+under any name it has had.
+The file must currently exist: a name that was renamed away can no
+longer be resolved and must be queried by object ID
+.Pq Fl o
+instead.
 .El
 .
 .Sh OUTPUT
-By default, the following columns are displayed:
-.Bl -tag -width "OLD_PATH" -compact -offset indent
+In the default (non-JSON) mode a header is printed followed by one
+line per event with the following columns:
+.Bl -tag -width "OPERATION" -compact -offset indent
 .It Sy TXG
 Transaction group in which the event occurred
-.It Sy TIME
-Timestamp of the event
 .It Sy OBJECT
 ZFS object ID of the affected file
-.It Sy EVENT
-Type of event (CREATE, REMOVE, RENAME, etc.)
-.It Sy PATH
-Path to the affected file
-.It Sy OLD_PATH
-For RENAME events, the previous path
+.It Sy OPERATION
+Type of event (CREATE, REMOVE, RENAME, SETATTR, TRUNCATE, WRITE,
+READ, \&...)
+.It Sy NAME
+Dataset-relative name of the affected file, for operations that
+carry a name.
+RENAME lines append the previous name in parentheses
+.Pq Dq "(from oldname)" .
 .El
 .Pp
-.Sy WRITE
+The kernel record also carries a timestamp, uid, gid, and mode where
+applicable, but these are not part of the text or JSON output of this
+command; use the wire interface
+.Pq Xr zmetad 8
+for the full record.
+.Pp
+In JSON mode
+.Pq Fl j
+the output is a single JSON array.
+Each event object always contains the keys
+.Sy txg ,
+.Sy object ,
 and
-.Sy READ
-events additionally carry
-.Sy IO_OFFSET
+.Sy op .
+The keys
+.Sy name
+and
+.Sy parent
+appear only when the record carries them (name-bearing metadata
+operations); TRUNCATE, SETATTR, WRITE, and READ records carry
+neither.
+Operation-specific keys are added as follows:
+.Bl -tag -width "TRUNCATE" -compact -offset indent
+.It Sy RENAME
+.Sy old_name , old_parent
+.It Sy TRUNCATE
+.Sy old_size , new_size
+.It Sy SYMLINK
+.Sy target
+.It Sy WRITE , READ
+.Sy io_offset
 (the window's first offset) and
-.Sy IO_BYTES
-(the summed byte total for the window) in JSON output.
+.Sy io_bytes
+(the summed byte total for the window)
+.El
+.Pp
+An empty log prints
+.Dq no events found .
+If records were overwritten by ring wraparound, a message of the form
+.Dq N record(s) lost to log wraparound
+is printed to standard error.
+If the log cannot be read at all,
+.Nm zfs Cm events
+prints a diagnostic to standard error and exits 1.
+.
+.Sh EXIT STATUS
+.Bl -tag -width "XX"
+.It 0
+Successful query or clear.
+.It 1
+Invalid option or argument, snapshot argument, unopenable dataset,
+failed clear, or a first-page read error.
+.El
 .
 .Sh EXAMPLES
-.Ss Example 1: Viewing recent events on a dataset
+.Ss Example 1: Viewing the events of a dataset
 .Bd -literal -offset indent
 # zfs events tank/data
-TXG      TIME                 OBJECT  EVENT    PATH
-1847     2026-03-09 10:15:23  128     CREATE   /tank/data/newfile.txt
-1848     2026-03-09 10:16:01  128     SETATTR  /tank/data/newfile.txt
-1850     2026-03-09 10:18:45  128     RENAME   /tank/data/renamed.txt
-                                               (was: /tank/data/newfile.txt)
-1852     2026-03-09 10:20:12  129     CREATE   /tank/data/another.txt
-1855     2026-03-09 10:25:33  128     REMOVE   /tank/data/renamed.txt
+TXG        OBJECT   OPERATION  NAME
+---------- -------- ---------- --------------------
+1847       128      CREATE     newfile.txt
+1848       128      SETATTR
+1850       128      RENAME     renamed.txt (from newfile.txt)
+1852       129      CREATE     another.txt
+1855       128      REMOVE     renamed.txt
 .Ed
 .Ss Example 2: Getting the history of a specific file
+The path argument is resolved to the file's object ID, so the whole
+object history is shown, including records logged under earlier
+names:
 .Bd -literal -offset indent
-# zfs events tank/data /tank/data/important.txt
-TXG      TIME                 OBJECT  EVENT    PATH
-1200     2026-03-01 09:00:00  256     CREATE   /tank/data/important.txt
-1205     2026-03-01 09:15:00  256     SETATTR  /tank/data/important.txt
-1340     2026-03-05 14:30:00  256     RENAME   /tank/data/important.txt
-                                               (was: /tank/data/draft.txt)
+# zfs events tank/data important.txt
+TXG        OBJECT   OPERATION  NAME
+---------- -------- ---------- --------------------
+1200       256      CREATE     draft.txt
+1205       256      SETATTR
+1340       256      RENAME     important.txt (from draft.txt)
 .Ed
 .Ss Example 3: JSON output for scripting
+.Fl n
+returns the oldest events in the ring:
 .Bd -literal -offset indent
-# zfs events -j -n 1 tank/data
-{"txg":1855,"time":1741518333,"object":128,"event":"REMOVE",
- "path":"/tank/data/renamed.txt","uid":1000,"gid":1000,"mode":33188}
+# zfs events -j -n 2 tank/data
+[{"txg":1847,"object":128,"op":"CREATE","name":"newfile.txt","parent":4},
+{"txg":1848,"object":128,"op":"SETATTR"}]
 .Ed
-.Ss Example 4: Events since a snapshot
-.Bd -literal -offset indent
-# zfs events -t @yesterday tank/data
-TXG      TIME                 OBJECT  EVENT    PATH
-1847     2026-03-09 10:15:23  128     CREATE   /tank/data/newfile.txt
-\&...
-.Ed
-.Ss Example 5: Events between two snapshots
-.Bd -literal -offset indent
-# zfs events -t @monday..@friday tank/data
-.Ed
-.Ss Example 6: IO auditing
+.Ss Example 4: IO auditing
+WRITE and READ records carry no name; correlate them by object ID:
 .Bd -literal -offset indent
 # zfs set events_io=on tank/data
 # zfs set events_io_window=5000 tank/data
 # dd if=/dev/zero of=/tank/data/blob bs=1M count=64
-# zfs events -j -n 1 tank/data
-{"txg":1861,"object":130,"op":"WRITE","name":"blob",
- "io_offset":0,"io_bytes":67108864,"uid":1000,"gid":1000}
+# zfs events -j tank/data
+[{"txg":1860,"object":130,"op":"CREATE","name":"blob","parent":4},
+{"txg":1861,"object":130,"op":"WRITE","io_offset":0,"io_bytes":67108864}]
 .Ed
-.
-.Sh ENVIRONMENT VARIABLES
-.Bl -tag -width "ZFS_EVENTS_MAX"
-.It Ev ZFS_EVENTS_MAX
-Override the default maximum number of events to display.
-.El
+.Ss Example 5: Clearing a dataset's event log
+.Bd -literal -offset indent
+# zfs events -c tank/data
+cleared event log for 'tank/data'
+.Ed
 .
 .Sh INTERFACE STABILITY
 .Sy Evolving .
@@ -330,9 +393,10 @@ that triggered them, ensuring consistency with snapshots.
 The
 .Sy org.openzfs:events
 pool feature must be enabled for event logging to function.
-The feature is automatically activated when
-.Sy events=on
-is first set on any dataset in the pool.
+The feature is activated when the first event is logged on any
+dataset in the pool, not at the moment the
+.Sy events
+property is set.
 .Pp
 For long-term event retention beyond the ring buffer capacity, use
 .Xr zmetad 8

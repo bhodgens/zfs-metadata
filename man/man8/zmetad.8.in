@@ -15,7 +15,7 @@
 .\"
 .\" Copyright (c) 2026, OpenZFS Contributors. All rights reserved.
 .\"
-.Dd September 30, 2026
+.Dd October 1, 2026
 .Dt ZMETAD 8
 .Os
 .
@@ -25,11 +25,14 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl fhv
-.Op Fl c Ar config
 .Op Fl d Ar database
 .Op Fl i Ar interval
 .Op Fl r Ar days
+.Op Fl -schema Ar file
 .Op Fl -purge Ar dataset
+.Op Fl -export-schema Ar file
+.Op Fl -check-schema Ar file
+.Op Fl -force
 .
 .Sh DESCRIPTION
 The
@@ -61,14 +64,13 @@ interval (default 30 seconds).
 Send
 .Dv SIGUSR1
 to the daemon for an immediate collection cycle.
+.Pp
+All configuration is provided on the command line;
+.Nm
+has no configuration file.
 .
 .Sh OPTIONS
-.Bl -tag -width "--purge dataset"
-.It Fl c Ar config
-Read configuration from the specified file.
-See
-.Sx CONFIGURATION
-for details on the file format.
+.Bl -tag -width "--export-schema file"
 .It Fl d Ar database
 Path to the SQLite database file.
 The database will be created if it does not exist.
@@ -88,7 +90,8 @@ The daemon will check for new events on all datasets at this interval.
 Default: 30 seconds.
 Minimum: 1 second.
 .It Fl r Ar days
-Event retention period in days.
+Event retention period in days, 1 to 36500.
+Non-numeric, zero, and negative values are rejected.
 Events older than this are automatically deleted during the daily
 cleanup cycle.
 Retention deletes
@@ -101,8 +104,18 @@ and
 tables are never touched by retention, which is what makes the
 .Sy gaps
 counts lifetime figures.
-Set to 0 to disable automatic cleanup.
+Rows with a NULL
+.Sy captured_at
+(pre-v4 rows that predate ingest-time stamping) are never deleted by
+retention.
 Default: 90 days.
+.It Fl -schema Ar file
+Load the wire event schema from
+.Ar file
+instead of the schema embedded in the binary.
+The daemon refuses to start if the file fails to parse or its
+.Sy schema_version
+disagrees with the version already stored in the database.
 .It Fl -purge Ar dataset
 One-shot purge mode: instead of running the daemon, delete all
 database rows belonging to
@@ -121,45 +134,42 @@ The kernel-ring clear preserves ring identity, and the dataset's
 mapping row is left in place.
 Exit status is 0 on success, 1 on a database or kernel error, and 2
 if the dataset does not exist.
+.It Fl -export-schema Ar file
+One-shot mode: write the embedded canonical event schema JSON to
+.Ar file
+and exit.
+Refuses to overwrite an existing file unless
+.Fl -force
+is given (the file is opened exclusively).
+.It Fl -check-schema Ar file
+One-shot mode: validate
+.Ar file
+against the embedded canonical schema and exit.
+The comparison covers the full field set - field names, types, and
+order - not just the schema version; any drift is reported and the
+exit status is 1.
+.It Fl -force
+Allow
+.Fl -export-schema
+to overwrite an existing file.
+It takes no argument.
 .It Fl v
 Verbose mode.
 May be specified multiple times for increased verbosity.
 .El
-.
-.Sh CONFIGURATION
-Configuration can be provided via command-line options or a configuration
-file specified with
-.Fl c .
-Command-line options override configuration file settings.
-.Pp
-The configuration file uses a simple key-value format:
-.Bd -literal -offset indent
-# ZFS Metadata Export Daemon configuration
-
-# Poll interval in seconds
-poll_interval = 30
-
-# SQLite database path
-database = /var/lib/zfs/zmetad.db
-
-# Event retention in days (0 = forever)
-retention_days = 90
-
-# Maximum database size in MB (0 = unlimited)
-max_size_mb = 1000
-.Ed
 .
 .Sh DATABASE SCHEMA
 The SQLite database layout version is recorded in the
 .Sy meta
 table under the
 .Sy db_schema_version
-key; this build writes layout version 4.
-The database contains five tables:
+key; this build writes layout version 5.
+The database contains six tables:
 .Sy events ,
 .Sy sync_state ,
 .Sy datasets ,
 .Sy gaps ,
+.Sy objmap ,
 and
 .Sy meta .
 The full column-by-column contract, including the
@@ -244,6 +254,15 @@ column holds the ingest time as unix seconds; the
 .Sy timestamp
 column holds the kernel's monotonic event time and is not a wall
 clock.
+The
+.Sy path
+and
+.Sy old_path
+columns hold dataset-relative names exactly as logged on the wire -
+never join them with a mountpoint prefix in a WHERE clause; scope
+queries by
+.Sy dataset
+and match the bare relative name.
 .Ss Recent events across all datasets
 .Bd -literal -offset indent
 SELECT * FROM events
@@ -253,8 +272,8 @@ ORDER BY captured_at DESC;
 .Ss History of a specific file
 .Bd -literal -offset indent
 SELECT * FROM events
-WHERE path = '/tank/data/important.txt'
-   OR old_path = '/tank/data/important.txt'
+WHERE dataset = 'tank/data'
+  AND (path = 'important.txt' OR old_path = 'important.txt')
 ORDER BY txg;
 .Ed
 .Ss Files deleted in a dataset
@@ -287,20 +306,30 @@ ORDER BY day DESC;
 .Bl -tag -width "/var/lib/zfs/zmetad.db"
 .It Pa /var/lib/zfs/zmetad.db
 Default SQLite database location.
-.It Pa @sysconfdir@/zfs/zmetad.conf
-Default configuration file location.
-.It Pa @runstatedir@/zmetad.pid
-Process ID file when running as a daemon.
 .It Pa contrib/zmetad/SCHEMA.md
 Source-tree path to the consumer contract for the database schema
 (all tables, column semantics, loss-accounting formulas, and the
 version-evolution policy).
 .El
+.Pp
+.Nm
+writes no pidfile; the process is identified by the usual process
+table or by its service manager.
 .
 .Sh SIGNALS
 .Bl -tag -width "SIGTERM"
 .It Sy SIGHUP
-Reload configuration and rescan for datasets with events enabled.
+Reserved: accepted and ignored (configuration reload is not
+implemented; there is no configuration file to reload).
+The shipped
+.Pa zmetad.service
+unit defines an
+.Sy ExecReload
+line
+.Pq Pa /bin/kill Fl HUP $MAINPID ,
+so
+.Ic systemctl reload zmetad
+succeeds but is a no-op, consistent with this documentation.
 .It Sy SIGUSR1
 Request an immediate out-of-band collection cycle, independent of the
 poll interval.
@@ -342,6 +371,17 @@ Collected 3 events from tank/home
 .Bd -literal -offset indent
 # zmetad --purge tank/old
 purged tank/old: 1234 events, 0 gaps removed; kernel ring cleared
+.Ed
+.Ss Example 5: Exporting and checking the wire schema
+.Bd -literal -offset indent
+# zmetad --export-schema events-schema.json
+schema written to events-schema.json
+# zmetad --export-schema events-schema.json
+refusing to overwrite existing file events-schema.json (use --force)
+# zmetad --export-schema --force events-schema.json
+schema written to events-schema.json
+# zmetad --check-schema events-schema.json
+schema file OK (version 2)
 .Ed
 .
 .Sh INTERFACE STABILITY
@@ -401,9 +441,17 @@ the
 .Sy events_size
 property.
 .Pp
-The database sync state is based on byte offset in the ring buffer.
-If a dataset is destroyed and recreated with the same name, stale
-sync state may cause events to be missed.
-In this case, delete the corresponding row from the
+The database sync state is based on byte offset in the ring buffer,
+but offsets alone are not ambiguous across ring instances: each
+sync-state row also stores the kernel ring's identity
+.Pq Sy ring_guid .
+If a dataset is destroyed and recreated with the same name, the daemon
+detects the new ring automatically, records a
+.Sy gaps
+row with
+.Sy lost No = -1
+at the boundary, and restarts collection from offset 0.
+No manual edits to
 .Sy sync_state
-table.
+are required or recommended; see section 6 (ring identity rules) of
+.Pa contrib/zmetad/SCHEMA.md .

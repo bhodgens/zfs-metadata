@@ -1267,11 +1267,15 @@ The default value is
 .Sy off .
 This property is inherited by descendant datasets.
 .Pp
-When this property is first set to
-.Sy on
-on any dataset in a pool, the
+The
 .Sy org.openzfs:events
-pool feature is activated.
+pool feature is activated on the first logged event for any dataset in
+a pool, not at the moment this property is set: a dataset with
+.Sy events=on
+that has not yet performed a logged operation leaves the feature
+.Sy enabled
+but not
+.Sy active .
 See
 .Xr zpool-features 7
 for details.
