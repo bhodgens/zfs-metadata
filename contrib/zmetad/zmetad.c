@@ -639,6 +639,20 @@ fetch:
 	have_guid = (nvlist_lookup_uint64(events, "ring_guid",
 	    &ring_guid) == 0 && ring_guid != 0);
 
+	/*
+	 * Dataset root object id (kernel-provided, GET_EVENTS reply).
+	 * Zero on legacy kernels; the resolver then falls back to the
+	 * empty-graph heuristic. Learned fresh every poll so it is
+	 * current before any of this page's records resolve.
+	 */
+	{
+		uint64_t root_id = 0;
+
+		if (nvlist_lookup_uint64(events, "root_objid",
+		    &root_id) == 0 && root_id != 0)
+			zmetad_db_set_root_id(db, dataset, root_id);
+	}
+
 	if (have_guid) {
 		uint64_t stored = ls->stored_guid;
 

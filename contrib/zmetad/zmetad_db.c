@@ -123,7 +123,7 @@ static const char *datasets_sql =
 	"CREATE TABLE IF NOT EXISTS datasets ("
 	"    dataset TEXT PRIMARY KEY,"
 	"    mountpoint TEXT NOT NULL"
-	");"
+	");";
 
 static const char *upsert_mountpoint_sql =
 	"INSERT OR REPLACE INTO datasets (dataset, mountpoint, last_seen) "
@@ -981,9 +981,78 @@ objmap_graph_empty(zmetad_db_t *db, const char *dataset)
 	return (rc == SQLITE_DONE);
 }
 
+static int objmap_resolve_root(zmetad_db_t *db, const char *dataset,
+    uint64_t parent, uint64_t root_id, const char *name, char **pathp);
+
+/*
+ * Learned dataset root object ids (GET_EVENTS "root_objid").  The
+ * resolver needs the exact root to distinguish "ancestor is the
+ * dataset root" (terminus) from "ancestor lost" (PARTIAL): the objmap
+ * never maps the root, and root ids vary per dataset, so graph
+ * emptiness alone cannot decide once any row exists.
+ */
+struct root_id_entry {
+	char	*dataset;
+	uint64_t id;
+	struct root_id_entry *next;
+};
+
+static struct root_id_entry *g_root_ids;
+
+void
+zmetad_db_set_root_id(zmetad_db_t *db, const char *dataset, uint64_t id)
+{
+	struct root_id_entry *e;
+
+	(void) db;
+	for (e = g_root_ids; e != NULL; e = e->next) {
+		if (strcmp(e->dataset, dataset) == 0) {
+			e->id = id;
+			return;
+		}
+	}
+
+	e = calloc(1, sizeof (*e));
+	if (e == NULL)
+		return;
+	e->dataset = strdup(dataset);
+	if (e->dataset == NULL) {
+		free(e);
+		return;
+	}
+	e->id = id;
+	e->next = g_root_ids;
+	g_root_ids = e;
+}
+
+static uint64_t
+objmap_root_id(const char *dataset)
+{
+	struct root_id_entry *e;
+
+	for (e = g_root_ids; e != NULL; e = e->next) {
+		if (strcmp(e->dataset, dataset) == 0)
+			return (e->id);
+	}
+	return (0);
+}
+
 static int
 objmap_resolve(zmetad_db_t *db, const char *dataset, uint64_t parent,
     const char *name, char **pathp)
+{
+	return (objmap_resolve_root(db, dataset, parent,
+	    objmap_root_id(dataset), name, pathp));
+}
+
+/*
+ * root_id: the dataset root object id as reported by the kernel
+ * (GET_EVENTS "root_objid"). Nonzero makes "ancestor == root" exact;
+ * zero (legacy kernel) falls back to the empty-graph heuristic.
+ */
+static int
+objmap_resolve_root(zmetad_db_t *db, const char *dataset, uint64_t parent,
+    uint64_t root_id, const char *name, char **pathp)
 {
 	char segs[ZMETAD_PATH_MAX_DEPTH][256];
 	size_t lens[ZMETAD_PATH_MAX_DEPTH];
@@ -1000,7 +1069,8 @@ objmap_resolve(zmetad_db_t *db, const char *dataset, uint64_t parent,
 		return (ENOENT);
 	memcpy(segs[0], name, lens[0] + 1);
 	total = lens[0];
-	if (parent == 0 || parent == UINT64_MAX) {
+	if (parent == 0 || parent == UINT64_MAX ||
+	    (root_id != 0 && parent == root_id)) {
 		/* Already at the dataset root: only the name. */
 		goto build;
 	}
@@ -1011,6 +1081,11 @@ objmap_resolve(zmetad_db_t *db, const char *dataset, uint64_t parent,
 
 		if (depth >= ZMETAD_PATH_MAX_DEPTH - 1)
 			return (ENOENT);	/* cycle / corrupt graph */
+
+		if (parent == root_id) {
+			/* Dataset root (kernel-reported): terminus. */
+			goto build;
+		}
 
 		sqlite3_reset(stmt);
 		sqlite3_bind_text(stmt, 1, dataset, -1, SQLITE_STATIC);
