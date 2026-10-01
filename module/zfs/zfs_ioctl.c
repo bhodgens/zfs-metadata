@@ -503,6 +503,20 @@ zfs_secpolicy_write_perms(const char *name, const char *perm, cred_t *cr)
 }
 
 /*
+ * Policy for clearing a dataset's event log: a destructive operation,
+ * so it requires the same write-class permission as setting the
+ * events property (root in the global zone, or the delegated "events"
+ * permission).
+ */
+static int
+zfs_secpolicy_clear_events(zfs_cmd_t *zc, nvlist_t *innvl, cred_t *cr)
+{
+	(void) innvl;
+	return (zfs_secpolicy_write_perms(zc->zc_name,
+	    zfs_prop_to_name(ZFS_PROP_EVENTS), cr));
+}
+
+/*
  * Policy for setting the security label property.
  *
  * Returns 0 for success, non-zero for access and other errors.
@@ -2727,6 +2741,45 @@ zfs_prop_set_special(const char *dsname, zprop_source_t source,
 				err = ENOTSUP;
 				break;
 			}
+
+			/*
+			 * Compatibility-constrained pools: activating a
+			 * feature outside the pool's compatibility set
+			 * breaks the contract that the pool stays
+			 * importable by the constrained software. The
+			 * compatibility files are userland data (e.g.
+			 * /etc/zfs/compatibility.d) which the kernel
+			 * cannot parse, so full membership enforcement
+			 * is not possible here; enforce what is
+			 * verifiable: the fixed "legacy" set by
+			 * construction excludes events, so reject it
+			 * unless the feature is already active on the
+			 * pool. For any other non-"off" setting, warn
+			 * that activation may violate the constraint.
+			 */
+			if (spa->spa_compatibility != NULL &&
+			    spa->spa_compatibility[0] != '\0' &&
+			    strcmp(spa->spa_compatibility,
+			    ZPOOL_COMPAT_OFF) != 0 &&
+			    !spa_feature_is_active(spa, SPA_FEATURE_EVENTS)) {
+				if (strcmp(spa->spa_compatibility,
+				    ZPOOL_COMPAT_LEGACY) == 0) {
+					spa_close(spa, FTAG);
+					cmn_err(CE_WARN, "cannot enable "
+					    "events on '%s': pool "
+					    "compatibility '%s' excludes "
+					    "the org.openzfs:events "
+					    "feature", dsname,
+					    ZPOOL_COMPAT_LEGACY);
+					err = ENOTSUP;
+					break;
+				}
+				cmn_err(CE_WARN, "enabling events on '%s': "
+				    "pool compatibility '%s' is set; "
+				    "kernel cannot verify that it includes "
+				    "org.openzfs:events", dsname,
+				    spa->spa_compatibility);
+			}
 			spa_close(spa, FTAG);
 		}
 
@@ -4367,14 +4420,13 @@ zfs_ioc_get_events(const char *dsname, nvlist_t *innvl, nvlist_t *outnvl)
 	}
 
 	/*
-	 * A clear request arrives as offset == UINT64_MAX: reset the
-	 * ring. This rides the established get-events ioctl rather than
-	 * adding a new one. The reset uses the mounted zfsvfs' objset
-	 * and the pool config lock is not held by this thread, which is
-	 * exactly the environment the VFS logging path assigns its
-	 * transaction in.  clear_task assigns before it takes the
-	 * ring lock for the header reset.  Clearing requires the
-	 * dataset to be mounted.
+	 * Clearing the ring is destructive. The preferred interface
+	 * is the dedicated ZFS_IOC_CLEAR_EVENTS ioctl (write-class
+	 * secpolicy, read-only pool check). The historically
+	 * overloaded UINT64_MAX offset on this read ioctl is kept
+	 * hardened for already-deployed userland: zfs_secpolicy_events
+	 * demands destroy-level permission for it, and the read-only
+	 * pool check below rejects EROFS.
 	 */
 	if (offset == UINT64_MAX) {
 		zfsvfs_t *zfsvfs;
@@ -4404,17 +4456,20 @@ zfs_ioc_get_events(const char *dsname, nvlist_t *innvl, nvlist_t *outnvl)
 	if (error != 0)
 		return (error);
 
-	buf = vmem_alloc(bufsize, KM_SLEEP);
-	read_len = bufsize;
-	start_offset = offset;
-
+	/*
+	 * Fail early on unmounted datasets before spending the 256KB
+	 * read buffer on a request that cannot succeed.
+	 */
 	zfsvfs_t *io_zfsvfs;
 	error = getzfsvfs_impl(os, &io_zfsvfs);
 	if (error != 0) {
-		vmem_free(buf, bufsize);
 		dmu_objset_rele(os, FTAG);
 		return (error);
 	}
+
+	buf = vmem_alloc(bufsize, KM_SLEEP);
+	read_len = bufsize;
+	start_offset = offset;
 
 	error = zfs_events_get(os, &io_zfsvfs->z_events_lock, &offset,
 	    &read_len, buf);
@@ -4554,6 +4609,51 @@ zfs_ioc_get_events(const char *dsname, nvlist_t *innvl, nvlist_t *outnvl)
 	vmem_free(buf, bufsize);
 	dmu_objset_rele(os, FTAG);
 	return (0);
+}
+
+/*
+ * Reset a dataset's event ring, discarding all recorded events.
+ * Destructive, so it is registered with a write-class secpolicy and
+ * the read-only/suspended pool checks (unlike the read-side
+ * get-events ioctl). Requires the dataset to be mounted.
+ */
+static const zfs_ioc_key_t zfs_keys_clear_events[] = {
+	/* no nvl keys */
+};
+
+static int
+zfs_ioc_clear_events(const char *dsname, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	zfsvfs_t *zfsvfs;
+	int err;
+
+	(void) innvl;
+	(void) outnvl;
+
+	err = getzfsvfs(dsname, &zfsvfs);
+	if (err != 0)
+		return (err);
+
+	/*
+	 * zfs_events_clear_task() assigns its transaction with
+	 * DMU_TX_WAIT, which can sleep for a txg under throttling;
+	 * it takes the ring lock itself only for the header reset so
+	 * VFS event loggers on this dataset do not stall across the
+	 * assign. Clear means discard ALL history, so records
+	 * appended while the clear transaction is in flight are
+	 * legitimately discarded as well; the header reset itself is
+	 * a single transaction-serialized write.
+	 */
+	if (!spa_writeable(dmu_objset_spa(zfsvfs->z_os))) {
+		zfs_vfs_rele(zfsvfs);
+		return (SET_ERROR(EROFS));
+	}
+
+	err = zfs_events_clear_task(zfsvfs->z_os,
+	    &zfsvfs->z_events_lock);
+
+	zfs_vfs_rele(zfsvfs);
+	return (err);
 }
 
 static const zfs_ioc_key_t zfs_keys_channel_program[] = {
@@ -8040,6 +8140,11 @@ zfs_ioctl_init(void)
 	    zfs_ioc_get_events, zfs_secpolicy_events, DATASET_NAME,
 	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
 	    zfs_keys_get_events, ARRAY_SIZE(zfs_keys_get_events));
+
+	zfs_ioctl_register("clear_events", ZFS_IOC_CLEAR_EVENTS,
+	    zfs_ioc_clear_events, zfs_secpolicy_clear_events, DATASET_NAME,
+	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_FALSE, B_FALSE,
+	    zfs_keys_clear_events, ARRAY_SIZE(zfs_keys_clear_events));
 
 	/* IOCTLS that use the legacy function signature */
 
