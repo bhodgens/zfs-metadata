@@ -971,6 +971,7 @@ daemon_loop(zmetad_db_t *db)
 {
 	uint64_t last_collect = 0;
 	uint64_t last_cleanup = 0;
+	boolean_t cleaned_once = B_FALSE;
 
 	while (!g_shutdown) {
 		uint64_t now = mono_secs();
@@ -1019,8 +1020,14 @@ daemon_loop(zmetad_db_t *db)
 			last_collect = mono_secs();
 		}
 
-		/* Cleanup old events daily */
-		if (now - last_cleanup >= 86400) {
+		/*
+		 * Cleanup old events daily. The first tick is
+		 * included: with a monotonic clock, last_cleanup = 0
+		 * means "never run", not "ran at uptime 0", so a
+		 * freshly booted host must still enforce retention
+		 * immediately.
+		 */
+		if (!cleaned_once || now - last_cleanup >= 86400) {
 			if (g_config.retention_days > 0) {
 				int cerr = zmetad_db_cleanup(db,
 				    g_config.retention_days);
@@ -1031,6 +1038,7 @@ daemon_loop(zmetad_db_t *db)
 				}
 			}
 			last_cleanup = mono_secs();
+			cleaned_once = B_TRUE;
 		}
 
 		/* Sleep for a bit */
