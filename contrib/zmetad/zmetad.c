@@ -117,6 +117,16 @@ daemon_warn(const char *fmt, ...)
 		syslog(LOG_WARNING, "%s", buf);
 }
 
+static void
+db_warn_sink(const char *msg)
+{
+	/*
+	 * daemon_warn takes a printf-style format; msg is data, so go
+	 * through "%s" to keep any embedded '%' literal.
+	 */
+	daemon_warn("%s", msg);
+}
+
 /*
  * Monotonic wall-clock-free seconds for interval scheduling: an NTP
  * step or DST change must not stretch or shrink the poll interval
@@ -330,18 +340,14 @@ run_purge(const zmetad_config_t *cfg)
 	/*
 	 * A daemon polling this dataset would otherwise read the purge
 	 * (records_lost reset to 0, offsets reset) as a watermark
-	 * regression on its very next poll. Bumping the epoch lets it
-	 * re-arm instead.
+	 * regression on its very next poll.  Bumping the DATASET's own
+	 * epoch (meta key 'purge_epoch:<dataset>', atomic) lets it
+	 * re-arm; other datasets' loss state is untouched.
 	 */
-	{
-		uint64_t epoch = 0;
-
-		if (zmetad_db_get_purge_epoch(g_db, &epoch) == 0 &&
-		    zmetad_db_set_purge_epoch(g_db, epoch + 1) != 0) {
-			fprintf(stderr, "warning: could not record purge "
-			    "epoch; a running daemon may report a spurious "
-			    "regression for %s\n", ds);
-		}
+	if (zmetad_db_bump_purge_epoch(g_db, ds) != 0) {
+		fprintf(stderr, "warning: could not record purge "
+		    "epoch; a running daemon may report a spurious "
+		    "regression for %s\n", ds);
 	}
 
 	printf("purged %s: %lld events, %lld gaps removed; "
@@ -419,12 +425,13 @@ detect_loss(const char *dataset, zmetad_db_t *db, struct loss_state *ls,
 	 * A --purge under a live daemon resets both the kernel counters
 	 * and the DB rows; the epoch moves first, so re-arm before the
 	 * counters are read rather than depending on spotting a
-	 * decrease afterwards.
+	 * decrease afterwards.  The epoch is per dataset (DB layout 7):
+	 * purging one dataset does not re-arm the others.
 	 */
 	{
 		uint64_t epoch = 0;
 
-		if (zmetad_db_get_purge_epoch(db, &epoch) == 0 &&
+		if (zmetad_db_get_purge_epoch(db, dataset, &epoch) == 0 &&
 		    epoch != ls->purge_epoch) {
 			ls->purge_epoch = epoch;
 			ls->have_lost = B_FALSE;
@@ -437,18 +444,26 @@ detect_loss(const char *dataset, zmetad_db_t *db, struct loss_state *ls,
 	if (!ls->have_lost) {
 		/*
 		 * First observation of this dataset this process
-		 * lifetime: restore the persisted baseline (DB layout
-		 * 6). NULL/absent = no baseline; the first poll after
-		 * ring creation invents no gap for pre-existing
-		 * history. With a baseline, a wrap that happened
-		 * while the daemon was down becomes a delta rather
-		 * than a silent re-arm.
+		 * lifetime: restore the persisted baseline (DB
+		 * layout 6). NULL/absent = no baseline; the first
+		 * poll after ring creation invents no gap for
+		 * pre-existing history. With a baseline, a wrap that
+		 * happened while the daemon was down becomes a delta
+		 * rather than a silent re-arm.  A query ERROR (EIO)
+		 * is NOT "no baseline": skip loss detection this
+		 * poll -- re-arming here would swallow the loss
+		 * accumulated since the last persisted baseline.
 		 */
 		boolean_t have = B_FALSE;
 		uint64_t stored = 0;
 
 		if (zmetad_db_get_last_lost(db, dataset, &have,
-		    &stored) == 0 && have) {
+		    &stored) == EIO) {
+			daemon_warn("cannot read loss baseline for %s; "
+			    "skipping loss detection this poll\n", dataset);
+			return (0);
+		}
+		if (have) {
 			ls->last_lost = stored;
 			ls->have_lost = B_TRUE;
 		}
@@ -699,6 +714,15 @@ fetch:
 			ls->high_water = 0;
 			ls->have_high_water = B_FALSE;
 			ls->stored_guid = ring_guid;
+			/*
+			 * Clear the PERSISTED loss baseline too: it
+			 * belongs to the old ring.  Left in place, a
+			 * new-ring counter >= the old baseline would
+			 * produce a meaningless cross-ring delta (or
+			 * mask real new-ring loss) on the next poll.
+			 */
+			(void) zmetad_db_set_last_lost(db, dataset,
+			    B_FALSE, 0);
 
 			if (!refetched) {
 				refetched = B_TRUE;
@@ -847,12 +871,13 @@ fetch:
 	 * Advance the watermark from the returned next_offset,
 	 * persisting the ring identity in the same write.  When the
 	 * ring was replaced above, last_offset was reset to 0: the
-	 * new ring's records start from its own offset space.  On a
-	 * legacy reply (no guid) the stored identity is left alone
-	 * (0 binds NULL, and INSERT OR REPLACE keeps last_sync
-	 * fresh without disturbing identity tracking).  Skipped
-	 * entirely when any insert in this batch failed: the batch
-	 * was rolled back and the page must be re-read next poll.
+	 * new ring's records start from its own offset space.  The
+	 * upsert preserves a previously stored guid when the reply
+	 * carries none (0 binds NULL upstream): a legacy reply never
+	 * erases the stored identity, so a later kernel upgrade does
+	 * not lose swap detection.  Skipped entirely when any insert
+	 * in this batch failed: the batch was rolled back and the
+	 * page must be re-read next poll.
 	 */
 	if (!insert_failed) {
 		if (next_offset > 0) {
@@ -1331,6 +1356,14 @@ main(int argc, char **argv)
 		libzfs_fini(g_zfs);
 		return (EXIT_FAILURE);
 	}
+
+	/*
+	 * DB-layer runtime warnings mirror daemon_warn (stderr plus
+	 * syslog when daemonized); without this they would vanish
+	 * into /dev/null once daemonized.  open-path errors keep
+	 * plain fprintf -- they run with a live stderr or exit.
+	 */
+	zmetad_db_set_warn(db, db_warn_sink);
 
 	/* One-shot purge mode: no signals, no daemonize, no loop. */
 	if (g_config.purge_dataset != NULL) {

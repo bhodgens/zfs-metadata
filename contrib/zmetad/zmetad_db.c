@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <time.h>
 
@@ -31,7 +32,7 @@
 #include "zmetad.h"
 #include "zmetad_schema.h"
 
-#define	ZMETAD_DB_SCHEMA_VERSION	6
+#define	ZMETAD_DB_SCHEMA_VERSION	7
 
 struct zmetad_db {
 	sqlite3		*sqlite;
@@ -47,7 +48,40 @@ struct zmetad_db {
 	sqlite3_stmt	*get_last_lost_stmt;
 	sqlite3_stmt	*set_last_lost_stmt;
 	const zmetad_schema_t *schema;
+	/*
+	 * Runtime warning sink (set by the daemon via
+	 * zmetad_db_set_warn so warnings survive daemonization);
+	 * NULL falls back to stderr.
+	 */
+	void		(*warn)(const char *msg);
 };
+
+void
+zmetad_db_set_warn(zmetad_db_t *db, void (*cb)(const char *msg))
+{
+	if (db != NULL)
+		db->warn = cb;
+}
+
+/*
+ * Emit a runtime warning through the installed sink, or stderr when
+ * none was installed (one-shot CLI modes, early open).
+ */
+static void
+db_warn(zmetad_db_t *db, const char *fmt, ...)
+{
+	char buf[1024];
+	va_list ap;
+
+	va_start(ap, fmt);
+	(void) vsnprintf(buf, sizeof (buf), fmt, ap);
+	va_end(ap);
+
+	if (db->warn != NULL)
+		db->warn(buf);
+	else
+		(void) fputs(buf, stderr);
+}
 
 /*
  * One ALTER TABLE ADD COLUMN migration step: a table plus the
@@ -176,7 +210,8 @@ static const char *schema_sql =
 	"    last_offset INTEGER NOT NULL,"
 	"    last_sync INTEGER NOT NULL,"
 	"    ring_guid INTEGER,"
-	"    last_lost INTEGER"
+	"    last_lost INTEGER,"
+	"    root_id INTEGER"
 			");"
 	"CREATE TABLE IF NOT EXISTS meta ("
 	"    key TEXT PRIMARY KEY,"
@@ -221,7 +256,13 @@ static const char *get_ring_guid_sql =
 /*
  * Single watermark write: last_offset + ring_guid together, so a
  * ring swap persists the reset offset and the new identity in one
- * statement.  ring_guid binding of NULL stores an unknown identity.
+ * statement.  ring_guid binding of NULL stores "identity unknown"
+ * WITHOUT erasing a previously stored identity: the DO UPDATE keeps
+ * the stored guid when the incoming one is NULL (a legacy reply
+ * binds NULL upstream), so mixed-version operation cannot lose swap
+ * detection.  Only a non-NULL (nonzero) incoming guid replaces it.
+ * The DO UPDATE touches exactly these three columns; last_lost and
+ * root_id are owned by their own writers and survive this upsert.
  */
 static const char *set_last_offset_sql =
 	"INSERT INTO sync_state "
@@ -229,7 +270,8 @@ static const char *set_last_offset_sql =
 	"ON CONFLICT(dataset) DO UPDATE SET "
 	"last_offset = excluded.last_offset, "
 	"last_sync = excluded.last_sync, "
-	"ring_guid = excluded.ring_guid";
+	"ring_guid = CASE WHEN excluded.ring_guid IS NULL "
+	"THEN sync_state.ring_guid ELSE excluded.ring_guid END";
 
 /*
  * last_lost is written on its own (each poll that observed the
@@ -245,12 +287,36 @@ static const char *set_last_lost_sql =
 	"VALUES (?, 0, 0, ?) "
 	"ON CONFLICT(dataset) DO UPDATE SET last_lost = excluded.last_lost";
 
-static const char *get_purge_epoch_sql =
-	"SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'purge_epoch'";
+/*
+ * Persisted dataset root object id (DB layout 7): the full-path
+ * resolver's fallback when a poll reply carries no "root_objid"
+ * (legacy kernel).  Own upsert, like last_lost: the offset writer
+ * must not touch this column and this writer must not move the
+ * watermark (insert path uses the NOT NULL defaults 0/0, which a
+ * conflicting row's DO UPDATE never observes).
+ */
+static const char *set_root_id_sql =
+	"INSERT INTO sync_state "
+	"(dataset, last_offset, last_sync, root_id) VALUES (?, 0, 0, ?) "
+	"ON CONFLICT(dataset) DO UPDATE SET root_id = excluded.root_id";
 
-static const char *set_purge_epoch_sql =
-	"INSERT INTO meta (key, value) VALUES ('purge_epoch', ?) "
-	"ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+static const char *get_root_id_sql =
+	"SELECT root_id FROM sync_state WHERE dataset = ?";
+
+/*
+ * Per-dataset purge epoch (meta key 'purge_epoch:<dataset>').  The
+ * bump is ONE atomic upsert statement: the old read-then-write pair
+ * could lose an increment when a --purge raced another --purge.
+ * Per-dataset (not one global key) so purging dataset A does not
+ * re-arm datasets B and C's loss state for a poll.
+ */
+static const char *get_purge_epoch_sql =
+	"SELECT CAST(value AS INTEGER) FROM meta WHERE key = ?";
+
+static const char *bump_purge_epoch_sql =
+	"INSERT INTO meta (key, value) VALUES (?, '1') "
+	"ON CONFLICT(key) DO UPDATE SET value = "
+	"CAST(CAST(value AS INTEGER) + 1 AS TEXT)";
 
 static const char *purge_dataset_sql[] = {
 	"DELETE FROM events WHERE dataset = ?",
@@ -386,6 +452,35 @@ db_set_meta(zmetad_db_t *db, const char *key, const char *value)
 }
 
 /*
+ * Read a numeric meta value.  0 and *outp = value when present,
+ * ENOENT when absent, EIO on query failure; a non-numeric stored
+ * value is EINVAL (corrupt key).
+ */
+static int
+db_get_meta_u64(zmetad_db_t *db, const char *key, uint64_t *outp)
+{
+	char *str = NULL;
+	char *endptr = NULL;
+	uint64_t v;
+	int rc;
+
+	rc = db_get_meta(db, key, &str);
+	if (rc != 0)
+		return (rc);
+
+	v = strtoull(str, &endptr, 10);
+	if (str[0] == '\0' || endptr == str ||
+	    (endptr != NULL && *endptr != '\0'))
+		rc = EINVAL;
+	else {
+		*outp = v;
+		rc = 0;
+	}
+	free(str);
+	return (rc);
+}
+
+/*
  * ALTER TABLE ADD COLUMN helper: succeeds, and reports *added =
  * B_FALSE, when the column already exists ("duplicate column
  * name"), so a migration that died after applying some columns
@@ -413,7 +508,7 @@ db_add_column(zmetad_db_t *db, const char *table, const char *name,
 		sqlite3_free(errmsg);
 		return (0);
 	}
-	fprintf(stderr, "migration error adding %s.%s: %s\n", table, name,
+	db_warn(db, "migration error adding %s.%s: %s\n", table, name,
 	    errmsg != NULL ? errmsg : "unknown");
 	sqlite3_free(errmsg);
 	return (EIO);
@@ -433,6 +528,7 @@ db_migrate_stage(zmetad_db_t *db, unsigned long stage_version,
     const char *table, const db_column_t *cols, size_t ncols)
 {
 	char version_str[16];
+	boolean_t added_any = B_FALSE;
 	boolean_t added;
 	int rc;
 
@@ -447,13 +543,14 @@ db_migrate_stage(zmetad_db_t *db, unsigned long stage_version,
 			(void) zmetad_db_rollback(db);
 			return (rc);
 		}
+		added_any = added_any || added;
 	}
 
 	(void) snprintf(version_str, sizeof (version_str), "%lu",
 	    stage_version);
 	rc = db_set_meta(db, "db_schema_version", version_str);
 	if (rc != 0) {
-		fprintf(stderr, "Failed to record database "
+		db_warn(db, "Failed to record database "
 		    "layout version %lu\n", stage_version);
 		(void) zmetad_db_rollback(db);
 		return (rc);
@@ -465,8 +562,15 @@ db_migrate_stage(zmetad_db_t *db, unsigned long stage_version,
 		return (rc);
 	}
 
-	fprintf(stderr, "upgraded database to layout version %lu\n",
-	    stage_version);
+	/*
+	 * A stage can run with zero ALTERs applied: a fresh database
+	 * already has every column (schema_sql) and only lacks the
+	 * version stamp, as does one recovering from a stamp-only
+	 * failure.  Announcing "upgraded" there is noise.
+	 */
+	if (added_any)
+		db_warn(db, "upgraded database to layout version %lu\n",
+		    stage_version);
 	return (0);
 }
 
@@ -499,14 +603,16 @@ db_columns_present(zmetad_db_t *db, const char *table,
 }
 
 /*
- * Ensure the database layout version matches this build.  Version 1
- * (pre-gap-tracking), version 2 (pre-ring-identity) and version 3
- * (pre-captured_at) databases are upgraded in place with ALTER TABLE
- * ADD COLUMN; the added columns are NULL for old rows, which is the
- * correct representation for fields absent from those records.
- * Each stage runs in one transaction with its own version stamp, so
- * schema and version can never diverge after a crash.  A database
- * written by a NEWER layout is refused.
+ * Ensure the database layout version matches this build.  Layouts
+ * evolve additively via ALTER TABLE ADD COLUMN stages:
+ *   2: events graph columns   3: sync_state.ring_guid
+ *   4: events.captured_at     5: events full_path + objmap
+ *   6: sync_state.last_lost   7: sync_state.root_id
+ * The added columns are NULL for old rows, which is the correct
+ * representation for fields absent from those records.  Each stage
+ * runs in one transaction with its own version stamp, so schema and
+ * version can never diverge after a crash.  A database written by a
+ * NEWER layout is refused.
  *
  * Handle ownership: this function NEVER closes db->sqlite --
  * zmetad_db_open() owns the handle lifecycle and closes it on every
@@ -642,6 +748,27 @@ db_check_layout(zmetad_db_t *db)
 			return (rc);
 	}
 
+	/*
+	 * Version 6 -> 7: sync_state gains root_id, the persisted
+	 * dataset root object id.  Legacy kernels (GET_EVENTS without
+	 * "root_objid") previously degraded root-level records to
+	 * PARTIAL permanently once the objmap graph was non-empty;
+	 * with the root id persisted on first sighting, later polls
+	 * fall back to the STORED id when the reply lacks one.
+	 * Pre-v7 rows get NULL: 0/NULL means "no stored root id --
+	 * legacy kernel + heuristic fallback" (see SCHEMA.md).
+	 */
+	if (v < 7) {
+		static const db_column_t v7_columns[] = {
+			{ "root_id",		"INTEGER" },
+		};
+
+		rc = db_migrate_stage(db, 7, "sync_state",
+		    v7_columns, NDBCOLS(v7_columns));
+		if (rc != 0)
+			return (rc);
+	}
+
 	return (0);
 }
 
@@ -745,7 +872,9 @@ zmetad_db_open(zmetad_db_t **dbp, const char *path,
 	/*
 	 * datasets.last_seen for databases created before the
 	 * stale-row prune existed.  Duplicate-tolerant; no layout
-	 * version bump (see comment at datasets_v2_sql).
+	 * version bump (see the comment above datasets_sql: a
+	 * tolerant ALTER keeps old and new databases converged
+	 * without version churn).
 	 */
 	{
 		boolean_t added;
@@ -990,6 +1119,12 @@ static int objmap_resolve_root(zmetad_db_t *db, const char *dataset,
  * dataset root" (terminus) from "ancestor lost" (PARTIAL): the objmap
  * never maps the root, and root ids vary per dataset, so graph
  * emptiness alone cannot decide once any row exists.
+ *
+ * Each learned id is also persisted in sync_state.root_id (DB layout
+ * 7) so a legacy kernel reply -- no "root_objid" key at all -- can
+ * fall back to the STORED id instead of degrading every root-level
+ * record to PARTIAL forever.  NULL/0 in the column means "never
+ * learned": legacy kernel + heuristic fallback (SCHEMA.md Section 6).
  */
 struct root_id_entry {
 	char	*dataset;
@@ -999,12 +1134,11 @@ struct root_id_entry {
 
 static struct root_id_entry *g_root_ids;
 
-void
-zmetad_db_set_root_id(zmetad_db_t *db, const char *dataset, uint64_t id)
+static void
+root_id_cache_put(const char *dataset, uint64_t id)
 {
 	struct root_id_entry *e;
 
-	(void) db;
 	for (e = g_root_ids; e != NULL; e = e->next) {
 		if (strcmp(e->dataset, dataset) == 0) {
 			e->id = id;
@@ -1026,7 +1160,7 @@ zmetad_db_set_root_id(zmetad_db_t *db, const char *dataset, uint64_t id)
 }
 
 static uint64_t
-objmap_root_id(const char *dataset)
+root_id_cache_get(const char *dataset)
 {
 	struct root_id_entry *e;
 
@@ -1037,12 +1171,83 @@ objmap_root_id(const char *dataset)
 	return (0);
 }
 
+void
+zmetad_db_set_root_id(zmetad_db_t *db, const char *dataset, uint64_t id)
+{
+	sqlite3_stmt *stmt = NULL;
+	int rc;
+
+	/* Cache first: the resolver must see this id this poll. */
+	root_id_cache_put(dataset, id);
+
+	rc = sqlite3_prepare_v2(db->sqlite, set_root_id_sql, -1,
+	    &stmt, NULL);
+	if (rc != SQLITE_OK) {
+		db_warn(db, "Prepare root_id upsert error: %s\n",
+		    sqlite3_errmsg(db->sqlite));
+		return;
+	}
+	rc = sqlite3_bind_text(stmt, 1, dataset, -1, SQLITE_STATIC);
+	if (rc == SQLITE_OK)
+		rc = sqlite3_bind_int64(stmt, 2, (sqlite3_int64)id);
+	if (rc == SQLITE_OK)
+		rc = sqlite3_step(stmt);
+	(void) sqlite3_finalize(stmt);
+	if (rc != SQLITE_DONE) {
+		/*
+		 * Non-fatal: this poll still resolves from the cache;
+		 * the next sighting retries the persist.
+		 */
+		db_warn(db, "root_id persist failed for %s: %s\n", dataset,
+		    sqlite3_errmsg(db->sqlite));
+	}
+}
+
+/*
+ * The dataset's root object id: the in-memory cache (seeded this
+ * poll), else the value persisted in sync_state (DB layout 7; the
+ * legacy-kernel fallback), else 0 (never learned).
+ */
+static uint64_t
+objmap_root_id(zmetad_db_t *db, const char *dataset)
+{
+	sqlite3_stmt *stmt = NULL;
+	uint64_t id;
+	int rc;
+
+	id = root_id_cache_get(dataset);
+	if (id != 0)
+		return (id);
+
+	rc = sqlite3_prepare_v2(db->sqlite, get_root_id_sql, -1,
+	    &stmt, NULL);
+	if (rc != SQLITE_OK)
+		return (0);
+	rc = sqlite3_bind_text(stmt, 1, dataset, -1, SQLITE_STATIC);
+	if (rc == SQLITE_OK)
+		rc = sqlite3_step(stmt);
+	if (rc == SQLITE_ROW &&
+	    sqlite3_column_type(stmt, 0) != SQLITE_NULL)
+		id = (uint64_t)sqlite3_column_int64(stmt, 0);
+	(void) sqlite3_finalize(stmt);
+	if (rc != SQLITE_ROW && rc != SQLITE_DONE)
+		return (0);
+
+	/*
+	 * Seed the cache so repeated resolutions within this poll do
+	 * not re-query.
+	 */
+	if (id != 0)
+		root_id_cache_put(dataset, id);
+	return (id);
+}
+
 static int
 objmap_resolve(zmetad_db_t *db, const char *dataset, uint64_t parent,
     const char *name, char **pathp)
 {
 	return (objmap_resolve_root(db, dataset, parent,
-	    objmap_root_id(dataset), name, pathp));
+	    objmap_root_id(db, dataset), name, pathp));
 }
 
 /*
@@ -1250,13 +1455,13 @@ zmetad_db_insert_event(zmetad_db_t *db, const char *dataset, nvlist_t *event)
 	 */
 	rc = sqlite3_reset(stmt);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Insert reset error: %s\n",
+		db_warn(db, "Insert reset error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (EIO);
 	}
 	rc = sqlite3_clear_bindings(stmt);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Clear bindings error: %s\n",
+		db_warn(db, "Clear bindings error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (EIO);
 	}
@@ -1287,13 +1492,13 @@ zmetad_db_insert_event(zmetad_db_t *db, const char *dataset, nvlist_t *event)
 		if (rc == ENOENT)
 			continue;
 		if (rc != 0) {
-			fprintf(stderr, "Field %s: %s\n", name,
+			db_warn(db, "Field %s: %s\n", name,
 			    strerror(rc));
 			return (rc);
 		}
 		/* Guard: the record's type must match what we bound. */
 		if (str_field != (dtype == DATA_TYPE_STRING)) {
-			fprintf(stderr, "Field %s: unexpected wire type\n",
+			db_warn(db, "Field %s: unexpected wire type\n",
 			    name);
 			return (EINVAL);
 		}
@@ -1365,7 +1570,7 @@ zmetad_db_insert_event(zmetad_db_t *db, const char *dataset, nvlist_t *event)
 			rc = SQLITE_OK;
 		}
 		if (rc != SQLITE_OK) {
-			fprintf(stderr, "Bind error for field %s: %s\n",
+			db_warn(db, "Bind error for field %s: %s\n",
 			    name, sqlite3_errmsg(db->sqlite));
 			(void) sqlite3_reset(stmt);
 			return (EIO);
@@ -1378,7 +1583,7 @@ zmetad_db_insert_event(zmetad_db_t *db, const char *dataset, nvlist_t *event)
 	 */
 	rc = sqlite3_bind_text(stmt, 1, dataset, -1, SQLITE_STATIC);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Bind error for dataset: %s\n",
+		db_warn(db, "Bind error for dataset: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		(void) sqlite3_reset(stmt);
 		return (EIO);
@@ -1386,7 +1591,7 @@ zmetad_db_insert_event(zmetad_db_t *db, const char *dataset, nvlist_t *event)
 	rc = sqlite3_bind_text(stmt, 5, zmetad_schema_op_name(zs,
 	    have_op ? op : 0), -1, SQLITE_STATIC);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Bind error for event_type: %s\n",
+		db_warn(db, "Bind error for event_type: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		(void) sqlite3_reset(stmt);
 		return (EIO);
@@ -1400,7 +1605,7 @@ zmetad_db_insert_event(zmetad_db_t *db, const char *dataset, nvlist_t *event)
 	 */
 	rc = sqlite3_bind_int64(stmt, 19, (sqlite3_int64)time(NULL));
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Bind error for captured_at: %s\n",
+		db_warn(db, "Bind error for captured_at: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		(void) sqlite3_reset(stmt);
 		return (EIO);
@@ -1449,7 +1654,7 @@ zmetad_db_insert_event(zmetad_db_t *db, const char *dataset, nvlist_t *event)
 
 	rc = sqlite3_step(stmt);
 	if (rc != SQLITE_DONE && rc != SQLITE_CONSTRAINT) {
-		fprintf(stderr, "Insert error: %s\n",
+		db_warn(db, "Insert error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		(void) sqlite3_reset(stmt);
 		return (EIO);
@@ -1480,13 +1685,13 @@ zmetad_db_get_last_offset(zmetad_db_t *db, const char *dataset,
 	 */
 	rc = sqlite3_reset(stmt);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Get last_offset reset error: %s\n",
+		db_warn(db, "Get last_offset reset error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (EIO);
 	}
 	rc = sqlite3_bind_text(stmt, 1, dataset, -1, SQLITE_STATIC);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Get last_offset bind error: %s\n",
+		db_warn(db, "Get last_offset bind error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (EIO);
 	}
@@ -1510,7 +1715,7 @@ zmetad_db_get_last_offset(zmetad_db_t *db, const char *dataset,
 		return (ENOENT);
 	}
 
-	fprintf(stderr, "Get last_offset error for %s: %s\n", dataset,
+	db_warn(db, "Get last_offset error for %s: %s\n", dataset,
 	    sqlite3_errmsg(db->sqlite));
 	return (EIO);
 }
@@ -1528,13 +1733,13 @@ zmetad_db_get_ring_guid(zmetad_db_t *db, const char *dataset)
 
 	rc = sqlite3_reset(stmt);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Get ring_guid reset error: %s\n",
+		db_warn(db, "Get ring_guid reset error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (0);
 	}
 	rc = sqlite3_bind_text(stmt, 1, dataset, -1, SQLITE_STATIC);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Get ring_guid bind error: %s\n",
+		db_warn(db, "Get ring_guid bind error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (0);
 	}
@@ -1552,7 +1757,7 @@ zmetad_db_get_ring_guid(zmetad_db_t *db, const char *dataset)
 	 */
 	(void) sqlite3_reset(stmt);
 	if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
-		fprintf(stderr, "Get ring_guid error for %s: %s\n", dataset,
+		db_warn(db, "Get ring_guid error for %s: %s\n", dataset,
 		    sqlite3_errmsg(db->sqlite));
 	}
 
@@ -1574,7 +1779,7 @@ zmetad_db_set_last_offset(zmetad_db_t *db, const char *dataset,
 
 	rc = sqlite3_reset(stmt);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Set last_offset reset error: %s\n",
+		db_warn(db, "Set last_offset reset error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (EIO);
 	}
@@ -1597,7 +1802,7 @@ zmetad_db_set_last_offset(zmetad_db_t *db, const char *dataset,
 
 	rc = sqlite3_step(stmt);
 	if (rc != SQLITE_DONE) {
-		fprintf(stderr, "Set last_offset error: %s\n",
+		db_warn(db, "Set last_offset error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (EIO);
 	}
@@ -1605,16 +1810,18 @@ zmetad_db_set_last_offset(zmetad_db_t *db, const char *dataset,
 	return (0);
 
 bind_err:
-	fprintf(stderr, "Set last_offset bind error: %s\n",
+	db_warn(db, "Set last_offset bind error: %s\n",
 	    sqlite3_errmsg(db->sqlite));
 	return (EIO);
 }
 
 /*
- * Cumulative records_lost as of the previous poll, or ENOENT when the
- * dataset has no row yet (caller treats it as "no baseline": the first
- * poll after ring creation invents no gap for pre-existing history).
- * A NULL column is reported as ENOENT for the same reason.
+ * Cumulative records_lost as of the previous poll.  ENOENT means "no
+ * baseline" (no row yet, or a NULL column): the caller treats it as a
+ * fresh ring and invents no gap for pre-existing history.  A step
+ * ERROR (SQLITE_BUSY, IOERR, CORRUPT...) returns EIO so the caller
+ * SKIPS loss detection this poll instead of silently re-arming and
+ * swallowing loss accumulated since the last persisted baseline.
  */
 int
 zmetad_db_get_last_lost(zmetad_db_t *db, const char *dataset,
@@ -1623,21 +1830,46 @@ zmetad_db_get_last_lost(zmetad_db_t *db, const char *dataset,
 	sqlite3_stmt *stmt = db->get_last_lost_stmt;
 	int rc;
 
-	sqlite3_reset(stmt);
-	sqlite3_bind_text(stmt, 1, dataset, -1, SQLITE_STATIC);
+	*havep = B_FALSE;
+	*lostp = 0;
+
+	rc = sqlite3_reset(stmt);
+	if (rc != SQLITE_OK) {
+		db_warn(db, "Get last_lost reset error: %s\n",
+		    sqlite3_errmsg(db->sqlite));
+		return (EIO);
+	}
+	rc = sqlite3_bind_text(stmt, 1, dataset, -1, SQLITE_STATIC);
+	if (rc != SQLITE_OK) {
+		db_warn(db, "Get last_lost bind error: %s\n",
+		    sqlite3_errmsg(db->sqlite));
+		(void) sqlite3_reset(stmt);
+		return (EIO);
+	}
 	rc = sqlite3_step(stmt);
-	if (rc == SQLITE_DONE) {
-		sqlite3_reset(stmt);
-		return (ENOENT);
+	if (rc == SQLITE_ROW &&
+	    sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+		*lostp = (uint64_t)sqlite3_column_int64(stmt, 0);
+		*havep = B_TRUE;
+		rc = 0;
+	} else if (rc == SQLITE_DONE ||
+	    (rc == SQLITE_ROW &&
+	    sqlite3_column_type(stmt, 0) == SQLITE_NULL)) {
+		/* No row / no baseline: distinct from a query error. */
+		rc = ENOENT;
+	} else {
+		db_warn(db, "Get last_lost error for %s: %s\n", dataset,
+		    sqlite3_errmsg(db->sqlite));
+		rc = EIO;
 	}
-	if (rc != SQLITE_ROW || sqlite3_column_type(stmt, 0) == SQLITE_NULL) {
-		sqlite3_reset(stmt);
-		return (ENOENT);
-	}
-	*lostp = (uint64_t)sqlite3_column_int64(stmt, 0);
-	*havep = B_TRUE;
-	sqlite3_reset(stmt);
-	return (0);
+	/*
+	 * Always reset before returning: an unrestarted statement
+	 * keeps its read transaction open, pinning the WAL snapshot
+	 * and making later writes on this same connection fail with
+	 * SQLITE_BUSY (see zmetad_db_get_last_offset).
+	 */
+	(void) sqlite3_reset(stmt);
+	return (rc);
 }
 
 int
@@ -1662,25 +1894,46 @@ out:
 }
 
 /*
- * Monotonic purge epoch: --purge increments it; a running daemon notices
- * the move on its next poll, re-arms its in-memory watermark and loss
- * baseline, and so does not misread the post-purge drop as a regression.
+ * Per-dataset purge epoch (DB layout 7; meta key
+ * 'purge_epoch:<dataset>'): bumped by every successful
+ * `zmetad --purge <dataset>`; a running daemon compares ONLY its own
+ * dataset's epoch per poll, re-arming that dataset's in-memory
+ * watermark and loss baseline.  Per-dataset keys keep purging
+ * dataset A from re-arming B and C.
+ *
+ * Migration continuity: the legacy GLOBAL 'purge_epoch' key is read
+ * as the initial baseline for a dataset that has no per-dataset key
+ * yet, so epochs bumped by a pre-layout-7 zmetad are not forgotten
+ * (a daemon holding the old global value would otherwise see 0 < N
+ * and re-arm once, harmlessly; reading it once here is cleaner).
  */
 int
-zmetad_db_get_purge_epoch(zmetad_db_t *db, uint64_t *epochp)
+zmetad_db_get_purge_epoch(zmetad_db_t *db, const char *dataset,
+    uint64_t *epochp)
 {
 	sqlite3_stmt *stmt;
+	char key[512];
 	int rc;
+
+	*epochp = 0;
+
+	rc = snprintf(key, sizeof (key), "purge_epoch:%s", dataset);
+	if (rc < 0 || (size_t)rc >= sizeof (key))
+		return (ENAMETOOLONG);
 
 	rc = sqlite3_prepare_v2(db->sqlite, get_purge_epoch_sql, -1,
 	    &stmt, NULL);
 	if (rc != SQLITE_OK)
 		return (EIO);
-	rc = sqlite3_step(stmt);
+	rc = sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
+	if (rc == SQLITE_OK)
+		rc = sqlite3_step(stmt);
 	if (rc == SQLITE_DONE) {
-		*epochp = 0;
-		rc = 0;
-	} else if (rc == SQLITE_ROW) {
+		/* No per-dataset key yet: fall back to the legacy global. */
+		(void) sqlite3_finalize(stmt);
+		return (db_get_meta_u64(db, "purge_epoch", epochp));
+	}
+	if (rc == SQLITE_ROW) {
 		*epochp = (uint64_t)sqlite3_column_int64(stmt, 0);
 		rc = 0;
 	} else {
@@ -1690,17 +1943,27 @@ zmetad_db_get_purge_epoch(zmetad_db_t *db, uint64_t *epochp)
 	return (rc);
 }
 
+/*
+ * Atomic, per-dataset epoch bump: INSERT with the initial value 1 or
+ * ON CONFLICT an in-SQL increment, so two concurrent --purge runs
+ * cannot lose an increment (the old get-then-set could).
+ */
 int
-zmetad_db_set_purge_epoch(zmetad_db_t *db, uint64_t epoch)
+zmetad_db_bump_purge_epoch(zmetad_db_t *db, const char *dataset)
 {
 	sqlite3_stmt *stmt;
+	char key[512];
 	int rc;
 
-	rc = sqlite3_prepare_v2(db->sqlite, set_purge_epoch_sql, -1,
+	rc = snprintf(key, sizeof (key), "purge_epoch:%s", dataset);
+	if (rc < 0 || (size_t)rc >= sizeof (key))
+		return (ENAMETOOLONG);
+
+	rc = sqlite3_prepare_v2(db->sqlite, bump_purge_epoch_sql, -1,
 	    &stmt, NULL);
 	if (rc != SQLITE_OK)
 		return (EIO);
-	rc = sqlite3_bind_int64(stmt, 1, (sqlite3_int64)epoch);
+	rc = sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
 	if (rc == SQLITE_OK)
 		rc = sqlite3_step(stmt);
 	sqlite3_finalize(stmt);
@@ -1708,11 +1971,11 @@ zmetad_db_set_purge_epoch(zmetad_db_t *db, uint64_t epoch)
 }
 
 /*
- * Delete every row belonging to "dataset" from the events, gaps and
- * sync_state tables in ONE transaction: a midway failure rolls all
- * three deletes back instead of leaving events gone while
- * gaps/sync_state survive.  Row counts are returned through the
- * caller's array (events, gaps, sync_state order).
+ * Delete every row belonging to "dataset" from the events, gaps,
+ * sync_state and objmap tables in ONE transaction: a midway failure
+ * rolls all four deletes back instead of leaving events gone while
+ * gaps/sync_state/objmap survive.  Row counts are returned through
+ * the caller's array (events, gaps, sync_state, objmap order).
  */
 int
 zmetad_db_purge_dataset(zmetad_db_t *db, const char *dataset,
@@ -1785,7 +2048,7 @@ zmetad_db_insert_gap(zmetad_db_t *db, const char *dataset,
 
 	rc = sqlite3_prepare_v2(db->sqlite, insert_gap_sql, -1, &stmt, NULL);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Prepare gap insert error: %s\n",
+		db_warn(db, "Prepare gap insert error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (EIO);
 	}
@@ -1814,7 +2077,7 @@ zmetad_db_insert_gap(zmetad_db_t *db, const char *dataset,
 	rc = sqlite3_step(stmt);
 	(void) sqlite3_finalize(stmt);
 	if (rc != SQLITE_DONE) {
-		fprintf(stderr, "Gap insert error: %s\n",
+		db_warn(db, "Gap insert error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (EIO);
 	}
@@ -1822,7 +2085,7 @@ zmetad_db_insert_gap(zmetad_db_t *db, const char *dataset,
 	return (0);
 
 bind_err:
-	fprintf(stderr, "Gap insert bind error: %s\n",
+	db_warn(db, "Gap insert bind error: %s\n",
 	    sqlite3_errmsg(db->sqlite));
 	(void) sqlite3_finalize(stmt);
 	return (EIO);
@@ -1846,7 +2109,7 @@ zmetad_db_upsert_mountpoint(zmetad_db_t *db, const char *dataset,
 	rc = sqlite3_prepare_v2(db->sqlite, upsert_mountpoint_sql, -1,
 	    &stmt, NULL);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Prepare mountpoint upsert error: %s\n",
+		db_warn(db, "Prepare mountpoint upsert error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (EIO);
 	}
@@ -1864,7 +2127,7 @@ zmetad_db_upsert_mountpoint(zmetad_db_t *db, const char *dataset,
 	rc = sqlite3_step(stmt);
 	(void) sqlite3_finalize(stmt);
 	if (rc != SQLITE_DONE) {
-		fprintf(stderr, "Mountpoint upsert error: %s\n",
+		db_warn(db, "Mountpoint upsert error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (EIO);
 	}
@@ -1872,7 +2135,7 @@ zmetad_db_upsert_mountpoint(zmetad_db_t *db, const char *dataset,
 	return (0);
 
 bind_err:
-	fprintf(stderr, "Mountpoint upsert bind error: %s\n",
+	db_warn(db, "Mountpoint upsert bind error: %s\n",
 	    sqlite3_errmsg(db->sqlite));
 	(void) sqlite3_finalize(stmt);
 	return (EIO);
@@ -1892,20 +2155,20 @@ zmetad_db_prune_stale_datasets(zmetad_db_t *db, int64_t cycle_start)
 
 	rc = sqlite3_reset(stmt);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Prune datasets reset error: %s\n",
+		db_warn(db, "Prune datasets reset error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (EIO);
 	}
 	rc = sqlite3_bind_int64(stmt, 1, (sqlite3_int64)cycle_start);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Prune datasets bind error: %s\n",
+		db_warn(db, "Prune datasets bind error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (EIO);
 	}
 
 	rc = sqlite3_step(stmt);
 	if (rc != SQLITE_DONE) {
-		fprintf(stderr, "Prune datasets error: %s\n",
+		db_warn(db, "Prune datasets error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (EIO);
 	}
@@ -1998,14 +2261,14 @@ zmetad_db_cleanup(zmetad_db_t *db, int retention_days)
 
 	rc = sqlite3_prepare_v2(db->sqlite, cleanup_sql, -1, &stmt, NULL);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Prepare cleanup error: %s\n",
+		db_warn(db, "Prepare cleanup error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (EIO);
 	}
 
 	rc = sqlite3_bind_int64(stmt, 1, (sqlite3_int64)cutoff);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Cleanup bind error: %s\n",
+		db_warn(db, "Cleanup bind error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		(void) sqlite3_finalize(stmt);
 		return (EIO);
@@ -2014,7 +2277,7 @@ zmetad_db_cleanup(zmetad_db_t *db, int retention_days)
 	rc = sqlite3_step(stmt);
 	(void) sqlite3_finalize(stmt);
 	if (rc != SQLITE_DONE) {
-		fprintf(stderr, "Cleanup error: %s\n",
+		db_warn(db, "Cleanup error: %s\n",
 		    sqlite3_errmsg(db->sqlite));
 		return (EIO);
 	}
