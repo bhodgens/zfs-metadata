@@ -26,7 +26,7 @@
 #   fence-coalesce     window=5000: two writes 1s apart, close ->
 #                      ONE merged WRITE record, io_bytes=8192
 #   fence-disabled     window=0: 3 writes -> exactly 3 records
-#   flush-order        window=2000: a still-pending WRITE is flushed
+#   flush-order        window=5000: a still-pending WRITE is flushed
 #                      before the RENAME, so WRITE precedes RENAME
 #   close-flush        close(2) flushes a young window while another
 #                      fd holds the inode, so inactive cannot be the
@@ -158,6 +158,11 @@ cleanup() {
 	exit "$status"
 }
 trap cleanup EXIT
+# TERM/INT must clean up too (E2E-9): an EXIT-only trap leaks the
+# datasets and workdir when the suite is killed between steps.
+# Routing the signal through exit runs the EXIT trap above.
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 ds_mnt() {
 	"$ZFS" get -H -o value mountpoint "$1"
@@ -295,6 +300,29 @@ step_preflight() {
 		esac
 	done < <("$ZFS" list -r -H -o name "$BASE_DS" 2>/dev/null)
 
+	# Same leak class as the schema suite's preflight (E2E-9):
+	# destroy e2e-* / io-e2e-* children of $BASE_DS older than this
+	# run's pid scope.  Names minted by a live run always carry a
+	# pid >= this run's pid, so nothing in use is touched; the
+	# sweep only reaps leftovers of runs killed before their traps
+	# could fire.
+	while read -r d; do
+		case "$d" in
+		"$BASE_DS"/e2e-*|"$BASE_DS"/io-e2e-*) ;;
+		*) continue ;;
+		esac
+		case "$d" in
+		*-"$RUNID") continue ;;  # this run's own names: handled above
+		esac
+		_rid="${d##*-}"
+		case "$_rid" in
+		''|*[!0-9]*) continue ;;
+		esac
+		if [ "$_rid" -lt "$RUNID" ]; then
+			"${SUDO[@]}" "$ZFS" destroy -R "$d" >/dev/null 2>&1 || true
+		fi
+	done < <("$ZFS" list -r -H -o name "$BASE_DS" 2>/dev/null)
+
 	"${SUDO[@]}" "$ZFS" create "$DS1" || {
 		fail "preflight: create $DS1"
 		return
@@ -328,7 +356,7 @@ step_preflight() {
 	*) fail "preflight: unexpected mountpoint '$w'"; return ;;
 	esac
 
-	WD="$(mktemp -d /tmp/zio-e2e.XXXXXX)"
+	WD="$(mktemp -d /var/tmp/zio-e2e.XXXXXX)"
 
 	# Wire probe: lzc_get_events(ds, object, offset) with full
 	# pagination (pattern: cmd/zfs/zfs_main.c zfs_do_events).
@@ -658,10 +686,11 @@ io_bytes=4096, got $nb"
 step_flush_order() {
 	STEP=flush-order
 	require_probe flush-order || return
-	# DS3's window is 2000ms. The write is still pending when rename
-	# runs, so the pre-rename flush is what emits WRITE. On a
-	# window=0 dataset the write is already its own record and this
-	# step would pass with the flush sites removed.
+	# DS3's window is 5000ms (set by preflight). The write is still
+	# pending when rename runs, so the pre-rename flush is what
+	# emits WRITE. On a window=0 dataset the write is already its
+	# own record and this step would pass with the flush sites
+	# removed.
 	mnt="$(ds_mnt "$DS3")"
 	f="$mnt/o.bin"
 	"${SUDO[@]}" dd if=/dev/zero of="$f" bs=4096 count=1 \
