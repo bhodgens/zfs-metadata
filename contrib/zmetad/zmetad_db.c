@@ -32,7 +32,7 @@
 #include "zmetad.h"
 #include "zmetad_schema.h"
 
-#define	ZMETAD_DB_SCHEMA_VERSION	7
+#define	ZMETAD_DB_SCHEMA_VERSION	8
 
 struct zmetad_db {
 	sqlite3		*sqlite;
@@ -190,6 +190,7 @@ static const char *schema_sql =
 	"    attrs INTEGER,"
 	"    full_path TEXT,"
 	"    old_full_path TEXT,"
+	"    principal INTEGER,"
 	"    UNIQUE(dataset, txg, object_id, event_type, timestamp)"
 		");"
 	"CREATE INDEX IF NOT EXISTS idx_events_dataset_time "
@@ -222,9 +223,10 @@ static const char *insert_event_sql =
 	"INSERT OR IGNORE INTO events "
 	"(dataset, txg, timestamp, object_id, event_type, path, old_path, "
 	"uid, gid, mode, size, io_offset, io_bytes, parent, old_parent, "
-	"target, old_size, attrs, captured_at, full_path, old_full_path) "
+	"target, old_size, attrs, captured_at, full_path, old_full_path, "
+	"principal) "
 	"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-	"?, ?)";
+	"?, ?, ?)";
 
 /*
  * The objmap table is the objid -> (name, parent) graph the
@@ -608,6 +610,7 @@ db_columns_present(zmetad_db_t *db, const char *table,
  *   2: events graph columns   3: sync_state.ring_guid
  *   4: events.captured_at     5: events full_path + objmap
  *   6: sync_state.last_lost   7: sync_state.root_id
+ *   8: events.principal
  * The added columns are NULL for old rows, which is the correct
  * representation for fields absent from those records.  Each stage
  * runs in one transaction with its own version stamp, so schema and
@@ -765,6 +768,27 @@ db_check_layout(zmetad_db_t *db)
 
 		rc = db_migrate_stage(db, 7, "sync_state",
 		    v7_columns, NDBCOLS(v7_columns));
+		if (rc != 0)
+			return (rc);
+	}
+
+	/*
+	 * Version 7 -> 8: events gains principal, the opaque
+	 * application principal tag carried by ZFS_EV_PRINCIPAL
+	 * (gh zeta-object#7).  It is supplied by the writing
+	 * application through userspace and is NOT verified by the
+	 * kernel -- stored verbatim as a claim, never evidence.
+	 * Unregistered writers send no key: pre-v8 rows get NULL,
+	 * which is also the correct on-disk representation for
+	 * every record whose writer never registered a principal.
+	 */
+	if (v < 8) {
+		static const db_column_t v8_columns[] = {
+			{ "principal",		"INTEGER" },
+		};
+
+		rc = db_migrate_stage(db, 8, "events",
+		    v8_columns, NDBCOLS(v8_columns));
 		if (rc != 0)
 			return (rc);
 	}
@@ -1565,6 +1589,17 @@ zmetad_db_insert_event(zmetad_db_t *db, const char *dataset, nvlist_t *event)
 			    (sqlite3_int64)u64val);
 		} else if (strcmp(name, "attrs") == 0) {
 			rc = sqlite3_bind_int64(stmt, 18,
+			    (sqlite3_int64)u64val);
+		} else if (strcmp(name, "principal") == 0) {
+			/*
+			 * Opaque application principal tag (ZFS_EV_PRINCIPAL):
+			 * supplied by the writing application, NOT verified
+			 * by the kernel.  Stored verbatim as a claim, never
+			 * evidence.  A record without the key never reaches
+			 * this branch, so the column stays NULL (unregistered
+			 * writer) instead of a fabricated value.
+			 */
+			rc = sqlite3_bind_int64(stmt, 22,
 			    (sqlite3_int64)u64val);
 		} else {
 			rc = SQLITE_OK;
