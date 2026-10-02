@@ -202,6 +202,8 @@ zfs_znode_init(void)
 	    sizeof (znode_t), zfs_znode_cache_constructor_smr,
 	    zfs_znode_cache_destructor_smr, NULL, NULL, 0, 0);
 	VFS_SMR_ZONE_SET(znode_uma_zone);
+
+	zfs_events_qent_init();
 }
 
 static znode_t *
@@ -230,6 +232,8 @@ zfs_znode_init(void)
 	znode_cache = kmem_cache_create("zfs_znode_cache",
 	    sizeof (znode_t), 0, zfs_znode_cache_constructor,
 	    zfs_znode_cache_destructor, NULL, NULL, NULL, KMC_RECLAIMABLE);
+
+	zfs_events_qent_init();
 }
 
 static znode_t *
@@ -266,6 +270,8 @@ zfs_znode_fini(void)
 		znode_cache = NULL;
 	}
 #endif
+
+	zfs_events_qent_fini();
 }
 
 
