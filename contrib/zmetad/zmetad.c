@@ -174,6 +174,11 @@ config_init(zmetad_config_t *cfg)
 	cfg->query_dataset = NULL;
 	cfg->query_since_id = 0;
 	cfg->query_max_events = ZMETAD_DEFAULT_MAX_EVENTS;
+	cfg->tag_mode = ZMETAD_TAG_MODE_NONE;
+	cfg->tag_dataset = NULL;
+	cfg->tag_object_id = 0;
+	memset(cfg->tag_pairs, 0, sizeof (cfg->tag_pairs));
+	cfg->tag_pair_count = 0;
 	cfg->force = B_FALSE;
 	cfg->spool_path[0] = '\0';
 	cfg->spool_enabled = B_FALSE;
@@ -428,6 +433,117 @@ run_query(const zmetad_config_t *cfg)
 		    "recommended\n", cfg->query_dataset);
 	}
 
+	return (0);
+}
+
+/*
+ * One-shot mode: set/get/clear an object's S3-style tags (issue #13).
+ * Like --query, this needs no libzfs and no schema: main() dispatches
+ * it before libzfs_init() and the schema load.  Unlike --query it
+ * WRITES, so the database is opened through zmetad_db_open() with a
+ * NULL schema (the schema-free path: no wire-version negotiation, no
+ * events_schema_version stamp; table creation and the layout
+ * migration still run, exactly as --purge's database handle saw at
+ * its own open) -- a tag operation must not re-stamp the wire schema
+ * of a database a live daemon owns.
+ */
+static int
+run_tag_mode(const zmetad_config_t *cfg)
+{
+	zmetad_db_t *db = NULL;
+	int err;
+
+	err = zmetad_db_open(&db, cfg->db_path, NULL);
+	if (err != 0)
+		return (1);
+
+	switch (cfg->tag_mode) {
+	case ZMETAD_TAG_MODE_SET: {
+		nvlist_t *tags = fnvlist_alloc();
+		int i;
+
+		if (tags == NULL) {
+			fprintf(stderr, "cannot set tags for %s object %llu: "
+			    "out of memory\n", cfg->tag_dataset,
+			    (u_longlong_t)cfg->tag_object_id);
+			zmetad_db_close(db);
+			return (1);
+		}
+		for (i = 0; i < cfg->tag_pair_count; i++) {
+			char *eq = strchr(cfg->tag_pairs[i], '=');
+
+			/*
+			 * Split at the FIRST '=' so a value may itself
+			 * contain '='; the key is NUL-terminated in
+			 * place and the value starts one past it.
+			 */
+			*eq = '\0';
+			fnvlist_add_string(tags, cfg->tag_pairs[i],
+			    eq + 1);
+		}
+
+		err = zmetad_db_tag_set(db, cfg->tag_dataset,
+		    cfg->tag_object_id, tags);
+		fnvlist_free(tags);
+		if (err != 0) {
+			fprintf(stderr, "cannot set tags for %s object "
+			    "%llu: %s\n", cfg->tag_dataset,
+			    (u_longlong_t)cfg->tag_object_id,
+			    strerror(err));
+			zmetad_db_close(db);
+			return (1);
+		}
+		printf("%d tag(s) set for %s object %llu\n",
+		    cfg->tag_pair_count, cfg->tag_dataset,
+		    (u_longlong_t)cfg->tag_object_id);
+		break;
+	}
+	case ZMETAD_TAG_MODE_GET: {
+		nvlist_t *tags = NULL;
+		nvpair_t *pair = NULL;
+
+		err = zmetad_db_tag_get(db, cfg->tag_dataset,
+		    cfg->tag_object_id, &tags);
+		zmetad_db_close(db);
+		if (err != 0) {
+			fprintf(stderr, "cannot get tags for %s object "
+			    "%llu: %s\n", cfg->tag_dataset,
+			    (u_longlong_t)cfg->tag_object_id,
+			    strerror(err));
+			return (1);
+		}
+		/* Empty set prints nothing; exit 0 like --query. */
+		while ((pair = nvlist_next_nvpair(tags, pair)) != NULL) {
+			const char *val = NULL;
+
+			(void) nvpair_value_string(pair, &val);
+			printf("%s=%s\n", nvpair_name(pair),
+			    (val != NULL) ? val : "");
+		}
+		fnvlist_free(tags);
+		return (0);
+	}
+	case ZMETAD_TAG_MODE_CLEAR:
+		err = zmetad_db_tag_clear(db, cfg->tag_dataset,
+		    cfg->tag_object_id);
+		zmetad_db_close(db);
+		if (err != 0) {
+			fprintf(stderr, "cannot clear tags for %s object "
+			    "%llu: %s\n", cfg->tag_dataset,
+			    (u_longlong_t)cfg->tag_object_id,
+			    strerror(err));
+			return (1);
+		}
+		printf("tags cleared for %s object %llu\n",
+		    cfg->tag_dataset, (u_longlong_t)cfg->tag_object_id);
+		return (0);
+	default:
+		/* Unreachable: main() only dispatches set/get/clear. */
+		zmetad_db_close(db);
+		return (1);
+	}
+
+	zmetad_db_close(db);
 	return (0);
 }
 
@@ -1523,6 +1639,22 @@ usage(const char *progname)
 	    "most <count> rows\n");
 	fprintf(stderr, "                         (default: %d)\n",
 	    ZMETAD_DEFAULT_MAX_EVENTS);
+	fprintf(stderr, "  --tag-set <dataset>    Replace the object's tag "
+	    "set with the given --tag\n");
+	fprintf(stderr, "                         pairs and exit (requires "
+	    "--tag-object and at\n");
+	fprintf(stderr, "                         least one --tag)\n");
+	fprintf(stderr, "  --tag-get <dataset>    Print the object's tags as "
+	    "key=value lines and exit\n");
+	fprintf(stderr, "                         (requires --tag-object)\n");
+	fprintf(stderr, "  --tag-clear <dataset>  Delete the object's tags "
+	    "and exit (requires\n");
+	fprintf(stderr, "                         --tag-object)\n");
+	fprintf(stderr, "  --tag-object <id>      With --tag-set/--tag-get/"
+	    "--tag-clear: the object id\n");
+	fprintf(stderr, "  --tag <key=value>      With --tag-set: a tag pair; "
+	    "repeatable, first '='\n");
+	fprintf(stderr, "                         splits key from value\n");
 	fprintf(stderr, "  --force                Allow --export-schema to "
 	    "overwrite existing file\n");
 	fprintf(stderr, "  -v, --verbose          Verbose output\n");
@@ -1538,6 +1670,11 @@ static struct option longopts[] = {
 	{ "query",		required_argument,	NULL,	0x101 },
 	{ "since-id",		required_argument,	NULL,	0x102 },
 	{ "max-events",		required_argument,	NULL,	0x103 },
+	{ "tag-set",		required_argument,	NULL,	0x104 },
+	{ "tag-get",		required_argument,	NULL,	0x105 },
+	{ "tag-clear",		required_argument,	NULL,	0x106 },
+	{ "tag-object",		required_argument,	NULL,	0x107 },
+	{ "tag",		required_argument,	NULL,	0x108 },
 	{ "force",		no_argument,		NULL,	0x100 },
 	{ "foreground",		no_argument,		NULL,	'f' },
 	{ "interval",		required_argument,	NULL,	'i' },
@@ -1731,6 +1868,71 @@ main(int argc, char **argv)
 			}
 			break;
 		}
+		case 0x104:	/* --tag-set */
+		case 0x105:	/* --tag-get */
+		case 0x106: {	/* --tag-clear */
+			zmetad_tag_mode_t mode = (opt == 0x104) ?
+			    ZMETAD_TAG_MODE_SET :
+			    ((opt == 0x105) ? ZMETAD_TAG_MODE_GET :
+			    ZMETAD_TAG_MODE_CLEAR);
+			const char *name = (opt == 0x104) ? "--tag-set" :
+			    ((opt == 0x105) ? "--tag-get" : "--tag-clear");
+
+			if (g_config.tag_mode !=
+			    ZMETAD_TAG_MODE_NONE ||
+			    g_config.tag_dataset != NULL) {
+				fprintf(stderr, "%s given multiple times "
+				    "or combined with another tag "
+				    "mode\n", name);
+				usage(argv[0]);
+				return (EXIT_FAILURE);
+			}
+			if (optarg[0] == '-') {
+				fprintf(stderr, "%s dataset must not "
+				    "start with '-': %s\n", name, optarg);
+				usage(argv[0]);
+				return (EXIT_FAILURE);
+			}
+			g_config.tag_mode = mode;
+			g_config.tag_dataset = optarg;
+			break;
+		}
+		case 0x107: {	/* --tag-object */
+			char *endptr = NULL;
+
+			errno = 0;
+			g_config.tag_object_id = strtoull(optarg,
+			    &endptr, 10);
+			/* Digit-first guard: see --since-id above. */
+			if (optarg[0] < '0' || optarg[0] > '9' ||
+			    endptr == optarg || *endptr != '\0' ||
+			    errno == ERANGE) {
+				fprintf(stderr, "invalid --tag-object "
+				    "'%s': expected a non-negative "
+				    "integer\n", optarg);
+				usage(argv[0]);
+				return (EXIT_FAILURE);
+			}
+			break;
+		}
+		case 0x108:	/* --tag */
+			if (g_config.tag_pair_count >=
+			    ZMETAD_TAG_MAX_PAIRS) {
+				fprintf(stderr, "too many --tag pairs "
+				    "(at most %d)\n",
+				    ZMETAD_TAG_MAX_PAIRS);
+				usage(argv[0]);
+				return (EXIT_FAILURE);
+			}
+			if (strchr(optarg, '=') == NULL) {
+				fprintf(stderr, "invalid --tag '%s': "
+				    "expected key=value\n", optarg);
+				usage(argv[0]);
+				return (EXIT_FAILURE);
+			}
+			g_config.tag_pairs[g_config.tag_pair_count++] =
+			    optarg;
+			break;
 		case 'f':
 			g_config.foreground = B_TRUE;
 			break;
@@ -1853,9 +2055,52 @@ main(int argc, char **argv)
 		return (EXIT_FAILURE);
 	}
 
+	/*
+	 * --tag-object and --tag are modifiers of the --tag-* one-shot
+	 * modes: a stray one is a mangled invocation, not a daemon
+	 * start.  --tag-object is REQUIRED for all three modes (there
+	 * is no "whole dataset" tag operation); --tag belongs to
+	 * --tag-set only, and --tag-set rejects an empty pair list
+	 * early because an empty set is always a mistake at the CLI.
+	 */
+	if (g_config.tag_object_id != 0 || g_config.tag_pair_count > 0) {
+		if (g_config.tag_mode == ZMETAD_TAG_MODE_NONE) {
+			fprintf(stderr, "--tag-object and --tag require "
+			    "--tag-set, --tag-get or --tag-clear\n");
+			usage(argv[0]);
+			return (EXIT_FAILURE);
+		}
+		if (g_config.tag_mode != ZMETAD_TAG_MODE_SET &&
+		    g_config.tag_pair_count > 0) {
+			fprintf(stderr, "--tag requires --tag-set\n");
+			usage(argv[0]);
+			return (EXIT_FAILURE);
+		}
+	}
+	if (g_config.tag_mode != ZMETAD_TAG_MODE_NONE) {
+		if (g_config.tag_object_id == 0) {
+			fprintf(stderr, "--tag-set, --tag-get and "
+			    "--tag-clear require --tag-object\n");
+			usage(argv[0]);
+			return (EXIT_FAILURE);
+		}
+		if (g_config.tag_mode == ZMETAD_TAG_MODE_SET &&
+		    g_config.tag_pair_count == 0) {
+			fprintf(stderr, "--tag-set requires at least one "
+			    "--tag key=value pair\n");
+			usage(argv[0]);
+			return (EXIT_FAILURE);
+		}
+	}
+
 	/* One-shot query mode: needs no libzfs and no schema */
 	if (g_config.query_dataset != NULL) {
 		return (run_query(&g_config));
+	}
+
+	/* One-shot tag modes: needs no libzfs and no schema */
+	if (g_config.tag_mode != ZMETAD_TAG_MODE_NONE) {
+		return (run_tag_mode(&g_config));
 	}
 
 	/* One-shot schema modes: run and exit before any daemon setup */
