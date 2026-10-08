@@ -11,7 +11,7 @@
 .\"
 .\" Copyright (c) 2026, OpenZFS Contributors. All rights reserved.
 .\"
-.Dd October 1, 2026
+.Dd October 8, 2026
 .Dt ZMETAD 8
 .Os
 .
@@ -27,6 +27,9 @@
 .Op Fl r Ar days
 .Op Fl -schema Ar file
 .Op Fl -purge Ar dataset
+.Op Fl -query Ar dataset
+.Op Fl -since-id Ar id
+.Op Fl -max-events Ar count
 .Op Fl -export-schema Ar file
 .Op Fl -check-schema Ar file
 .Op Fl -force
@@ -146,6 +149,67 @@ The kernel-ring clear preserves ring identity, and the dataset's
 mapping row is left in place.
 Exit status is 0 on success, 1 on a database or kernel error, and 2
 if the dataset does not exist.
+.It Fl -query Ar dataset
+One-shot query mode: instead of running the daemon, print the stored
+events of
+.Ar dataset
+to standard output, one
+.Sy events
+row per line as a compact JSON object, and exit.
+Each line carries exactly the
+.Sy events
+column names documented in
+.Pa contrib/zmetad/SCHEMA.md
+(section 2.1) with the cursor field
+.Sy id
+prepended: NULL columns render as
+.Sy null ,
+TEXT columns as JSON strings, INTEGER columns as JSON numbers.
+Rows are returned in ascending
+.Sy id
+order; the cursor protocol, including the loss fallback, is SCHEMA.md
+section 8.5.
+The database file is never modified by a query: the connection
+creates no schema, applies no migration, and runs only SELECTs.
+The file must already exist \(em a query never creates a database,
+so a misspelled path is an error rather than an empty result \(em
+and the daemon may keep running while it is read.
+When more rows match than
+.Fl -max-events
+allows, only the first
+.Fl -max-events
+rows are printed, the line
+.Ql truncated: resume with --since-id N
+(N is the highest returned id) is written to standard error, and the
+exit status is still 0; resume from that id, and rows already
+delivered are never re-delivered.
+Exit status is 0 on success (a truncated result is not an error) and
+1 on a database or usage error.
+.It Fl -since-id Ar id
+With
+.Fl -query ,
+return only rows whose
+.Sy id
+is greater than
+.Ar id .
+Default: 0, meaning from the beginning.
+An incremental consumer stores one last-seen id per dataset and
+passes it back here to resume where the previous batch stopped
+(SCHEMA.md section 8.5).
+Non-numeric values are rejected, as is
+.Fl -since-id
+without
+.Fl -query .
+.It Fl -max-events Ar count
+With
+.Fl -query ,
+return at most
+.Ar count
+rows before truncating (see
+.Fl -query
+above).
+Default: 1000.
+Maximum: 100000000; zero and values above the maximum are rejected.
 .It Fl -export-schema Ar file
 One-shot mode: write the embedded canonical event schema JSON to
 .Ar file
@@ -484,6 +548,34 @@ SELECT date(captured_at, 'unixepoch') as day,
 FROM events
 GROUP BY day, event_type
 ORDER BY day DESC;
+.Ed
+.Ss Incremental cursor query
+.Bd -literal -offset indent
+# zmetad --query tank/data --since-id 4200 --max-events 500
+{"id":4201,"dataset":"tank/data","txg":15042,...}
+\&...
+truncated: resume with --since-id 4700
+# zmetad --query tank/data --since-id 4700 --max-events 500
+.Ed
+.Pp
+Store one last-seen
+.Sy id
+per dataset and pass it back as
+.Fl -since-id
+to continue an incremental read; a
+.Ql truncated
+line on standard error gives the resume id, and exit status stays 0.
+If the dataset has any loss history (the
+.Sy gaps
+table), fall back to a full rescan instead of trusting the
+incremental range; see section 8.5 of
+.Pa contrib/zmetad/SCHEMA.md .
+The equivalent plain SQL is:
+.Bd -literal -offset indent
+SELECT * FROM events
+WHERE dataset = 'tank/data' AND id > 4200
+ORDER BY id ASC
+LIMIT 500;
 .Ed
 .
 .Sh FILES

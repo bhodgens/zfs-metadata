@@ -20,6 +20,7 @@
 #include <strings.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <unistd.h>
 #include <time.h>
 
 #include <sqlite3.h>
@@ -332,6 +333,22 @@ static const char *set_meta_sql =
 static const char *cleanup_sql =
 	"DELETE FROM events WHERE captured_at IS NOT NULL AND "
 	"captured_at < ?";
+
+/*
+ * Incremental consumer query (one-shot --query; SCHEMA.md Section
+ * 8.5).  dataset-filtered, id-cursored, id-ordered, LIMIT-clamped;
+ * the +1 probe row detects truncation without buffering the result.
+ */
+static const char *query_events_sql =
+	"SELECT id, dataset, txg, timestamp, captured_at, object_id, "
+	"event_type, path, old_path, uid, gid, mode, size, io_offset, "
+	"io_bytes, parent, old_parent, target, old_size, attrs, "
+	"full_path, old_full_path, principal "
+	"FROM events WHERE dataset = ? AND id > ? ORDER BY id ASC "
+	"LIMIT ?";
+
+static const char *query_loss_sql =
+	"SELECT 1 FROM gaps WHERE dataset = ? LIMIT 1";
 
 /*
  * Explicit transaction wrappers.  BEGIN IMMEDIATE takes the write
@@ -1207,6 +1224,58 @@ zmetad_db_close(zmetad_db_t *db)
 		sqlite3_close(db->sqlite);
 
 	free(db);
+}
+
+/*
+ * One-shot --query opener: open an existing database WITHOUT any of
+ * zmetad_db_open()'s write-side effects (schema creation, ALTER
+ * migrations, version stamping, WAL switch).  A query must not mutate
+ * a database a live daemon owns, and must not "create" a database out
+ * of a typo'd path.  READWRITE (not pure READONLY) because SQLite
+ * cannot read a WAL database through a read-only connection unless a
+ * -shm exists and the reader can create it; the SQL this connection
+ * runs is all SELECTs, so the daemon's writer role is never contested.
+ * Busy timeout as in zmetad_db_open: a --query racing the daemon's
+ * poll write waits instead of failing.
+ */
+int
+zmetad_db_open_readonly(zmetad_db_t **dbp, const char *path)
+{
+	zmetad_db_t *db;
+	int rc;
+
+	/*
+	 * Existence check BEFORE the open: sqlite3_open_v2 without
+	 * CREATE reports generic SQLITE_CANTOPEN, not ENOENT, so a
+	 * typo'd path would read as a permissions problem.
+	 */
+	if (access(path, F_OK) != 0) {
+		fprintf(stderr, "cannot open database %s: %s (--query "
+		    "reads an existing database; it does not create "
+		    "one)\n", path, strerror(errno));
+		return (errno == ENOENT ? ENOENT : EIO);
+	}
+
+	db = calloc(1, sizeof (*db));
+	if (db == NULL)
+		return (ENOMEM);
+
+	rc = sqlite3_open_v2(path, &db->sqlite,
+	    SQLITE_OPEN_READWRITE, NULL);
+	if (rc != SQLITE_OK) {
+		fprintf(stderr, "cannot open database %s: %s\n", path,
+		    db->sqlite != NULL ?
+		    sqlite3_errmsg(db->sqlite) : "out of memory");
+		if (db->sqlite != NULL)
+			sqlite3_close(db->sqlite);
+		free(db);
+		return (EIO);
+	}
+
+	(void) sqlite3_busy_timeout(db->sqlite, 5000);
+
+	*dbp = db;
+	return (0);
 }
 
 /*
@@ -2474,5 +2543,236 @@ zmetad_db_cleanup(zmetad_db_t *db, int retention_days)
 		}
 	}
 
+	return (0);
+}
+
+/*
+ * Append "s" to fp as a quoted, JSON-escaped string: the same escape
+ * set the spool uses (\", \\, \n, \r, \t, \b, \f, \uXXXX for the
+ * remaining control bytes); non-ASCII UTF-8 passes through verbatim,
+ * which any JSON parser accepts.  Returns 0, or EIO on a write error.
+ */
+static int
+query_json_string(FILE *fp, const char *s)
+{
+	if (fputc('"', fp) == EOF)
+		return (EIO);
+	for (size_t i = 0; s[i] != '\0'; i++) {
+		unsigned char c = (unsigned char)s[i];
+		const char *esc = NULL;
+
+		switch (c) {
+		case '"':
+			esc = "\\\"";
+			break;
+		case '\\':
+			esc = "\\\\";
+			break;
+		case '\n':
+			esc = "\\n";
+			break;
+		case '\r':
+			esc = "\\r";
+			break;
+		case '\t':
+			esc = "\t";
+			break;
+		case '\b':
+			esc = "\\b";
+			break;
+		case '\f':
+			esc = "\\f";
+			break;
+		default:
+			if (c < 0x20) {
+				if (fprintf(fp, "\\u%04x",
+				    (unsigned)c) < 0)
+					return (EIO);
+				continue;
+			}
+			if (fputc(c, fp) == EOF)
+				return (EIO);
+			continue;
+		}
+		if (fputs(esc, fp) == EOF)
+			return (EIO);
+	}
+	if (fputc('"', fp) == EOF)
+		return (EIO);
+	return (0);
+}
+
+/*
+ * Render one events row as a compact NDJSON object from the row's
+ * own columns.  Field names are the SCHEMA.md Section 2.1 column
+ * names plus "id"; NULL column -> JSON null, TEXT column -> JSON
+ * string, INTEGER column -> JSON number.  The spool envelope is NOT
+ * reused: its wire names differ from the column names (Section 10
+ * vs Section 2.1).
+ */
+static int
+query_emit_row(FILE *fp, sqlite3_stmt *stmt, unsigned long long *idp)
+{
+	static const char *query_fields[] = {
+		"id", "dataset", "txg", "timestamp", "captured_at",
+		"object_id", "event_type", "path", "old_path",
+		"uid", "gid", "mode", "size", "io_offset", "io_bytes",
+		"parent", "old_parent", "target", "old_size", "attrs",
+		"full_path", "old_full_path", "principal",
+	};
+	const int nfields = (int)(sizeof (query_fields) /
+	    sizeof (query_fields[0]));
+	int rc = 0;
+
+	/*
+	 * Each row is one JSON object: the leading and trailing
+	 * braces make the NDJSON line self-contained and parseable.
+	 */
+	if (fputc('{', fp) == EOF)
+		return (EIO);
+
+	for (int i = 0; i < nfields && rc == 0; i++) {
+		if (i > 0 && fputc(',', fp) == EOF) {
+			rc = EIO;
+			break;
+		}
+		if (fprintf(fp, "\"%s\":", query_fields[i]) < 0) {
+			rc = EIO;
+			break;
+		}
+		if (sqlite3_column_type(stmt, i) == SQLITE_NULL) {
+			rc = (fputs("null", fp) == EOF) ? EIO : 0;
+			continue;
+		}
+		if (sqlite3_column_type(stmt, i) == SQLITE_TEXT) {
+			const unsigned char *val =
+			    sqlite3_column_text(stmt, i);
+
+			if (val == NULL) {
+				rc = (fputs("null", fp) == EOF) ?
+				    EIO : 0;
+				continue;
+			}
+			rc = query_json_string(fp, (const char *)val);
+			continue;
+		}
+		rc = (fprintf(fp, "%lld",
+		    (long long)sqlite3_column_int64(stmt, i)) < 0) ?
+		    EIO : 0;
+	}
+	if (rc == 0 && fputc('}', fp) == EOF)
+		rc = EIO;
+	if (rc == 0 && fputc('\n', fp) == EOF)
+		rc = EIO;
+	if (rc == 0)
+		*idp = (unsigned long long)
+		    sqlite3_column_int64(stmt, 0);
+	return (rc);
+}
+
+/*
+ * Incremental consumer query (SCHEMA.md Section 8.5): stream the
+ * dataset's event rows with id > since_id to fp in ascending id
+ * order, at most max_events rows.  LIMIT max_events + 1 detects
+ * truncation: the extra probe row proves more matching rows exist
+ * without buffering the result.  loss_seen is ANY gaps row for the
+ * dataset -- gaps offsets are kernel ring offsets, not ids (a
+ * different keyspace), so no per-range intersection warning is
+ * possible; the full-rescan decision is the consumer's.  Read-only:
+ * only SELECTs touch the database.
+ */
+int
+zmetad_db_query_events(zmetad_db_t *db, const char *dataset,
+    unsigned long long since_id, unsigned long long max_events,
+    FILE *fp, unsigned long long *returnedp,
+    unsigned long long *last_idp, boolean_t *truncatedp,
+    boolean_t *loss_seenp)
+{
+	sqlite3_stmt *stmt = NULL;
+	sqlite3_stmt *loss_stmt = NULL;
+	unsigned long long returned = 0;
+	unsigned long long last_id = 0;
+	boolean_t truncated = B_FALSE;
+	boolean_t loss_seen = B_FALSE;
+	int rc;
+
+	if (dataset == NULL || dataset[0] == '\0' || max_events == 0 ||
+	    max_events > ZMETAD_MAX_QUERY_EVENTS)
+		return (EINVAL);
+
+	*returnedp = 0;
+	*last_idp = 0;
+	*truncatedp = B_FALSE;
+	*loss_seenp = B_FALSE;
+
+	rc = sqlite3_prepare_v2(db->sqlite, query_events_sql, -1,
+	    &stmt, NULL);
+	if (rc != SQLITE_OK) {
+		db_warn(db, "Prepare query error: %s\n",
+		    sqlite3_errmsg(db->sqlite));
+		return (EIO);
+	}
+
+	rc = sqlite3_bind_text(stmt, 1, dataset, -1, SQLITE_STATIC);
+	if (rc == SQLITE_OK)
+		rc = sqlite3_bind_int64(stmt, 2,
+		    (sqlite3_int64)since_id);
+	if (rc == SQLITE_OK)
+		rc = sqlite3_bind_int64(stmt, 3,
+		    (sqlite3_int64)(max_events + 1));
+	if (rc != SQLITE_OK) {
+		db_warn(db, "Query bind error: %s\n",
+		    sqlite3_errmsg(db->sqlite));
+		(void) sqlite3_finalize(stmt);
+		return (EIO);
+	}
+
+	while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+		if (returned == max_events) {
+			/* The +1 probe row: matching rows continue. */
+			truncated = B_TRUE;
+			break;
+		}
+		rc = query_emit_row(fp, stmt, &last_id);
+		if (rc != 0) {
+			db_warn(db, "Query output error: %s\n",
+			    strerror(rc));
+			(void) sqlite3_finalize(stmt);
+			return (rc);
+		}
+		returned++;
+	}
+	(void) sqlite3_finalize(stmt);
+	if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+		db_warn(db, "Query error: %s\n",
+		    sqlite3_errmsg(db->sqlite));
+		return (EIO);
+	}
+	if (fflush(fp) != 0 || ferror(fp))
+		return (EIO);
+
+	rc = sqlite3_prepare_v2(db->sqlite, query_loss_sql, -1,
+	    &loss_stmt, NULL);
+	if (rc != SQLITE_OK) {
+		db_warn(db, "Prepare loss probe error: %s\n",
+		    sqlite3_errmsg(db->sqlite));
+		return (EIO);
+	}
+	rc = sqlite3_bind_text(loss_stmt, 1, dataset, -1, SQLITE_STATIC);
+	if (rc == SQLITE_OK)
+		rc = sqlite3_step(loss_stmt);
+	if (rc == SQLITE_ROW)
+		loss_seen = B_TRUE;
+	(void) sqlite3_finalize(loss_stmt);
+	if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+		db_warn(db, "Loss probe error: %s\n",
+		    sqlite3_errmsg(db->sqlite));
+		return (EIO);
+	}
+
+	*returnedp = returned;
+	*last_idp = last_id;
+	*truncatedp = truncated;
+	*loss_seenp = loss_seen;
 	return (0);
 }
