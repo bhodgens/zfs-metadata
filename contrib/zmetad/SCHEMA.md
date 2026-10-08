@@ -403,6 +403,73 @@ immediate out-of-band collect, after which the database is current as of
 that collect. See zmetad(8) for CLI details.
 
 
+## 8.5 Incremental event cursor (#17)
+
+`events.id` is the **consumption cursor** for incremental readers.
+Every event row's id comes from the table's
+`INTEGER PRIMARY KEY AUTOINCREMENT` counter (the `schema_sql` DDL),
+which gives the cursor three properties a resumable reader can rely
+on:
+
+- **Strictly monotonic in insert order** — each successful insert
+  allocates a higher id than every row before it, across all
+  datasets (the counter is table-global, not per-dataset; the
+  `INSERT OR IGNORE` dedup, Section 3, never rewrites an existing
+  row).
+- **Never reused** — AUTOINCREMENT (backed by `sqlite_sequence`)
+  never re-allocates the id of a deleted row, so neither retention
+  nor `--purge` can later hand an old id to a new event.
+- **Stable for surviving rows** — deletion (retention, `--purge`)
+  removes rows; it never renumbers or rewrites the survivors, so a
+  stored cursor keeps pointing at the same row.
+
+The access pattern is a keyed, ordered, clamped scan, per dataset —
+plain SQL. This section documents an access pattern only: it has
+**no `db_schema_version` impact** and the layout stays 8.
+
+```sql
+SELECT ... FROM events
+WHERE dataset = ? AND id > ?    -- stored cursor; 0 = from the beginning
+ORDER BY id ASC                 -- id order, not timestamp order
+LIMIT ?;                        -- batch size
+```
+
+equivalently the one-shot `zmetad --query <dataset> --since-id <id>
+--max-events <n>` (see zmetad(8)). The consumer stores **one
+last-seen id per dataset** and feeds it back as the next read's
+cursor. Order by `id`, never by `timestamp` alone: `timestamp` is
+the kernel's monotonic-per-boot event time and only orders records
+together with the dedup key (Section 3), while `id` is a total order
+over all inserts. Reads run against the live database (WAL; the
+daemon need not be stopped), and each returned row is one JSON
+object carrying exactly the Section 2.1 column names plus the
+leading `id` (NULL column → `null`).
+
+Truncation protocol: at most `--max-events` rows are returned per
+call (default 1000, cap 100000000). When more rows matched, zmetad
+still exits 0 and prints
+`truncated: resume with --since-id <highest-returned-id>` on
+standard error; the consumer resumes from exactly that id. Delivered
+rows are never re-delivered (`id > cursor`), so consecutive batches
+concatenate into the full ascending-id stream — no duplicates, no
+skips.
+
+Loss — the cursor bounds only what the database holds, not how
+completely it holds it: `events.id` says nothing about records the
+kernel lost before zmetad could insert them. Before acting on an
+incremental range, check the loss indicators — the `gaps` rows
+(Section 2.5), the loss-accounting formulas (Section 4), and PARTIAL
+rows (Section 7) — and **on any loss indication fall back to a full
+rescan** of the dataset (reset the stored cursor to 0 and re-read).
+There is deliberately **no runtime id-range warning**:
+`gaps.from_offset`/`to_offset` are kernel ring *offsets* (Section
+4.1), a different keyspace from `events.id`, so no query can
+intersect a gap row with an id range. The database records where
+completeness broke, not which ids are affected; correlating the two
+is the consumer's responsibility, and a full rescan is the only
+sound response.
+
+
 ## 9. Operational facts
 
 - **Retention** (`-r`/`--retention <days>`, default 90; must be

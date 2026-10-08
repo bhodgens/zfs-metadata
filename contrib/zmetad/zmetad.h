@@ -15,6 +15,7 @@
 
 #include <sys/types.h>
 #include <limits.h>
+#include <stdio.h>
 #include <libnvpair.h>
 
 #ifdef	__cplusplus
@@ -31,6 +32,15 @@ extern "C" {
  * time (see also the defensive check in zmetad_db_cleanup).
  */
 #define	ZMETAD_MAX_RETENTION_DAYS	36500	/* ~100 years */
+
+/*
+ * One-shot --query knobs.  max_events is the LIMIT on returned rows
+ * per call (the truncation/resume contract lives in SCHEMA.md); the
+ * upper bound keeps max_events + 1 (the one-past-the-end probe row)
+ * far inside long long range.
+ */
+#define	ZMETAD_DEFAULT_MAX_EVENTS	1000
+#define	ZMETAD_MAX_QUERY_EVENTS		100000000
 
 /*
  * Configuration file: parsed by zmetad_conf.c when present.  A
@@ -54,6 +64,14 @@ typedef struct zmetad_config {
 	char		*export_schema_path;
 	char		*check_schema_path;
 	char		*purge_dataset;
+	/*
+	 * One-shot --query mode (SCHEMA.md Section 8.5): read-only
+	 * incremental export of a dataset's event rows past the
+	 * consumer's last-seen id cursor.
+	 */
+	char		*query_dataset;
+	unsigned long long query_since_id;	/* --since-id, default 0 */
+	unsigned long long query_max_events;	/* --max-events, default 1000 */
 	boolean_t	force;
 	/*
 	 * Spool (NDJSON export) settings, leaf-01 contract: appended,
@@ -82,6 +100,15 @@ typedef struct zmetad_db zmetad_db_t;
 typedef struct zmetad_schema zmetad_schema_t;
 int zmetad_db_open(zmetad_db_t **dbp, const char *path,
     const zmetad_schema_t *zs);
+
+/*
+ * Open an EXISTING database read-only (one-shot `--query`; refuses a
+ * missing file instead of creating an empty one, and opens with
+ * SQLITE_OPEN_READWRITE only as required by WAL so a live daemon's
+ * database is readable without promoting this connection to a
+ * writer).  No schema creation, no migration, no version stamping.
+ */
+int zmetad_db_open_readonly(zmetad_db_t **dbp, const char *path);
 
 /*
  * Install the runtime warning sink for db-layer warnings (poll-path
@@ -184,6 +211,32 @@ int zmetad_db_bump_purge_epoch(zmetad_db_t *db, const char *dataset);
  */
 int zmetad_db_purge_dataset(zmetad_db_t *db, const char *dataset,
     long long counts[4]);
+
+/*
+ * Incremental event query (one-shot `zmetad --query <dataset>`; the
+ * cursor contract is documented in SCHEMA.md Section 8.5).  Streams
+ * NDJSON event rows for "dataset" with events.id > since_id in
+ * ascending id order, at most max_events rows, to fp.  The id is the
+ * consumption cursor and is rendered as the "id" field of every
+ * record.  Returns via *returnedp the number of rows printed, via
+ * *last_idp the id of the last row printed (0 when none -- the
+ * resume point for --since-id), and via *truncatedp whether matching
+ * rows exist beyond max_events (the caller prints the resume hint).
+ * Returns 0 on success (including zero rows), EIO on a database
+ * error, EINVAL on out-of-range arguments.
+ *
+ * loss_seen is set to B_TRUE when the dataset has ANY gaps row at
+ * all (ring replacement, regression, or recorded loss).  gaps
+ * offsets are kernel ring offsets, NOT events.id values (different
+ * keyspace), so no runtime per-range intersection is possible; a
+ * set loss flag tells the consumer a rescan decision is theirs (see
+ * Section 8.5).
+ */
+int zmetad_db_query_events(zmetad_db_t *db, const char *dataset,
+    unsigned long long since_id, unsigned long long max_events,
+    FILE *fp, unsigned long long *returnedp,
+    unsigned long long *last_idp, boolean_t *truncatedp,
+    boolean_t *loss_seenp);
 
 /*
  * Record an event-log gap for a dataset: records between
