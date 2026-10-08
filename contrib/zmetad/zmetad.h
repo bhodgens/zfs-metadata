@@ -204,13 +204,31 @@ int zmetad_db_bump_purge_epoch(zmetad_db_t *db, const char *dataset);
 
 /*
  * Delete every row belonging to "dataset" from the events, gaps,
- * sync_state and objmap tables.  Deleted row counts are reported
- * through counts[] in events, gaps, sync_state, objmap order.  The
- * deletes run in a single transaction.  Does not touch the kernel
- * event ring (see zmetad --purge).
+ * sync_state, objmap and tags tables.  Deleted row counts are
+ * reported through counts[] in events, gaps, sync_state, objmap
+ * order (tags is deleted too; it is not one of the reported
+ * counts).  The deletes run in a single transaction.  Does not
+ * touch the kernel event ring (see zmetad --purge).
  */
 int zmetad_db_purge_dataset(zmetad_db_t *db, const char *dataset,
     long long counts[4]);
+
+/*
+ * Object tags (issue #13): S3-style key/value tags keyed on
+ * (dataset, object_id, key).  Set replaces the object's whole tag
+ * set in one transaction; get returns every pair for the object
+ * (an empty nvlist, not an error, when there are none); clear
+ * deletes all of the object's rows idempotently.  Limits follow
+ * the S3 tagging contract: at most 10 tags per object, keys at
+ * most 128 characters, values at most 256 bytes; violations are
+ * rejected with EINVAL and nothing is written.
+ */
+int zmetad_db_tag_set(zmetad_db_t *db, const char *dataset,
+    unsigned long long object_id, const nvlist_t *tags);
+int zmetad_db_tag_get(zmetad_db_t *db, const char *dataset,
+    unsigned long long object_id, nvlist_t **out);
+int zmetad_db_tag_clear(zmetad_db_t *db, const char *dataset,
+    unsigned long long object_id);
 
 /*
  * Incremental event query (one-shot `zmetad --query <dataset>`; the

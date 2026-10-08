@@ -29,7 +29,7 @@
 #include "zmetad.h"
 #include "zmetad_schema.h"
 
-#define	ZMETAD_DB_SCHEMA_VERSION	8
+#define	ZMETAD_DB_SCHEMA_VERSION	9
 
 struct zmetad_db {
 	sqlite3		*sqlite;
@@ -41,6 +41,7 @@ struct zmetad_db {
 	sqlite3_stmt	*objmap_put_stmt;
 	sqlite3_stmt	*objmap_del_stmt;
 	sqlite3_stmt	*objmap_any_stmt;
+	sqlite3_stmt	*tag_del_obj_stmt;
 	sqlite3_stmt	*prune_datasets_stmt;
 	sqlite3_stmt	*get_last_lost_stmt;
 	sqlite3_stmt	*set_last_lost_stmt;
@@ -246,6 +247,45 @@ static const char *objmap_del_sql =
 static const char *objmap_any_sql =
 	"SELECT 1 FROM objmap WHERE dataset = ? LIMIT 1";
 
+/*
+ * Object tags (DB layout 9, issue #13): S3-style string:string
+ * key/value pairs keyed on (dataset, object_id, key).  The PRIMARY
+ * KEY gives replace-set semantics (INSERT OR REPLACE) and lets
+ * clear-all be one DELETE per object.  S3 limits (<= 10 tags per
+ * object, key <= 128 characters, value <= 256 bytes) are enforced
+ * in zmetad_db_tag_set(), the single write path.
+ *
+ * captured_at is unix seconds, the events.captured_at convention.
+ *
+ * Lifetime: tags are removed when a REMOVE event for the object is
+ * ingested (zmetad_db_insert_event) and by zmetad --purge.  They do
+ * NOT age out by time -- S3 tags live until object deletion or an
+ * explicit clear -- so retention (zmetad_db_cleanup) never touches
+ * this table.  RENAME needs no action: object_id is stable across
+ * renames, and tags key on (dataset, object_id), not on the name.
+ */
+static const char *tags_sql =
+	"CREATE TABLE IF NOT EXISTS tags ("
+	"    dataset TEXT NOT NULL,"
+	"    object_id INTEGER NOT NULL,"
+	"    key TEXT NOT NULL,"
+	"    value TEXT NOT NULL,"
+	"    captured_at INTEGER NOT NULL,"
+	"    PRIMARY KEY (dataset, object_id, key)"
+			");";
+
+static const char *tag_put_sql =
+	"INSERT OR REPLACE INTO tags "
+	"(dataset, object_id, key, value, captured_at) "
+	"VALUES (?, ?, ?, ?, ?)";
+
+static const char *tag_get_sql =
+	"SELECT key, value FROM tags "
+	"WHERE dataset = ? AND object_id = ?";
+
+static const char *tag_del_obj_sql =
+	"DELETE FROM tags WHERE dataset = ? AND object_id = ?";
+
 static const char *get_last_offset_sql =
 	"SELECT last_offset FROM sync_state WHERE dataset = ?";
 
@@ -322,6 +362,7 @@ static const char *purge_dataset_sql[] = {
 	"DELETE FROM gaps WHERE dataset = ?",
 	"DELETE FROM sync_state WHERE dataset = ?",
 	"DELETE FROM objmap WHERE dataset = ?",
+	"DELETE FROM tags WHERE dataset = ?",
 };
 
 static const char *get_meta_sql =
@@ -643,7 +684,8 @@ db_columns_present(zmetad_db_t *db, const char *table,
  *   2: events graph columns   3: sync_state.ring_guid
  *   4: events.captured_at     5: events full_path + objmap
  *   6: sync_state.last_lost   7: sync_state.root_id
- *   8: events.principal
+ *   8: events.principal       9: tags table (created by
+ * schema_sql on every open, so the stage only stamps the version)
  * The added columns are NULL for old rows, which is the correct
  * representation for fields absent from those records.  Each stage
  * runs in one transaction with its own version stamp, so schema and
@@ -854,6 +896,21 @@ db_check_layout(zmetad_db_t *db)
 		}
 	}
 
+	/*
+	 * Version 8 -> 9: the tags table (issue #13).  Like gaps, it
+	 * is created by schema_sql on EVERY open (CREATE TABLE IF NOT
+	 * EXISTS), so this stage carries no ALTERs: it only stamps
+	 * the version so a pre-9 database announces layout 9 once the
+	 * table exists.  Old rows are impossible by construction; a
+	 * migration that died before committing simply re-runs here.
+	 */
+	if (v < 9) {
+		rc = db_migrate_stage(db, 9, "tags", NULL, 0);
+		if (rc != 0)
+			return (rc);
+		v = 9;
+	}
+
 	return (0);
 }
 
@@ -948,6 +1005,31 @@ zmetad_db_open(zmetad_db_t **dbp, const char *path,
 	rc = sqlite3_exec(db->sqlite, datasets_sql, NULL, NULL, &errmsg);
 	if (rc != SQLITE_OK) {
 		fprintf(stderr, "Datasets table creation error: %s\n", errmsg);
+		sqlite3_free(errmsg);
+		sqlite3_close(db->sqlite);
+		free(db);
+		return (EIO);
+	}
+
+	rc = sqlite3_exec(db->sqlite, tags_sql, NULL, NULL, &errmsg);
+	if (rc != SQLITE_OK) {
+		fprintf(stderr, "Tags table creation error: %s\n", errmsg);
+		sqlite3_free(errmsg);
+		sqlite3_close(db->sqlite);
+		free(db);
+		return (EIO);
+	}
+
+	/*
+	 * Dataset-scoped lookups (tag get, --purge, phase-2 CLI
+	 * listings); the PRIMARY KEY already serves point lookups
+	 * by (dataset, object_id, key).
+	 */
+	rc = sqlite3_exec(db->sqlite,
+	    "CREATE INDEX IF NOT EXISTS idx_tags_dataset "
+	    "ON tags(dataset)", NULL, NULL, &errmsg);
+	if (rc != SQLITE_OK) {
+		fprintf(stderr, "Tags index creation error: %s\n", errmsg);
 		sqlite3_free(errmsg);
 		sqlite3_close(db->sqlite);
 		free(db);
@@ -1173,6 +1255,9 @@ zmetad_db_open(zmetad_db_t **dbp, const char *path,
 		rc = sqlite3_prepare_v2(db->sqlite, objmap_any_sql, -1,
 		    &db->objmap_any_stmt, NULL);
 	if (rc == SQLITE_OK)
+		rc = sqlite3_prepare_v2(db->sqlite, tag_del_obj_sql, -1,
+		    &db->tag_del_obj_stmt, NULL);
+	if (rc == SQLITE_OK)
 		rc = sqlite3_prepare_v2(db->sqlite, get_last_lost_sql, -1,
 		    &db->get_last_lost_stmt, NULL);
 	if (rc == SQLITE_OK)
@@ -1214,6 +1299,8 @@ zmetad_db_close(zmetad_db_t *db)
 		(void) sqlite3_finalize(db->objmap_del_stmt);
 	if (db->objmap_any_stmt)
 		(void) sqlite3_finalize(db->objmap_any_stmt);
+	if (db->tag_del_obj_stmt)
+		(void) sqlite3_finalize(db->tag_del_obj_stmt);
 	if (db->get_last_lost_stmt)
 		(void) sqlite3_finalize(db->get_last_lost_stmt);
 	if (db->set_last_lost_stmt)
@@ -1865,6 +1952,39 @@ zmetad_db_insert_event(zmetad_db_t *db, const char *dataset, nvlist_t *event)
 	(void) objmap_update(db, dataset, op, have_op, object,
 	    have_object, rec_name, have_name, parent, have_parent);
 
+	/*
+	 * REMOVE lifetime coupling (issue #13): the object's tags die
+	 * with it.  This runs INSIDE the caller's batch transaction
+	 * (zmetad.c wraps each poll's inserts in begin/commit), so the
+	 * event insert and the tag delete commit atomically or both
+	 * roll back.  RENAME needs no such action here: object_id is
+	 * stable across renames and tags key on (dataset, object_id),
+	 * not on the name.
+	 */
+	if (have_op && have_object &&
+	    zmetad_schema_op_name(zs, op) != NULL &&
+	    strcmp(zmetad_schema_op_name(zs, op), "REMOVE") == 0) {
+		sqlite3_stmt *tdel = db->tag_del_obj_stmt;
+
+		rc = sqlite3_reset(tdel);
+		if (rc == SQLITE_OK)
+			rc = sqlite3_bind_text(tdel, 1, dataset, -1,
+			    SQLITE_STATIC);
+		if (rc == SQLITE_OK)
+			rc = sqlite3_bind_int64(tdel, 2,
+			    (sqlite3_int64)object);
+		if (rc == SQLITE_OK)
+			rc = sqlite3_step(tdel);
+		(void) sqlite3_reset(tdel);
+		if (rc != SQLITE_DONE) {
+			db_warn(db, "tag remove for %s object %llu failed: "
+			    "%s\n", dataset, (u_longlong_t)object,
+			    sqlite3_errmsg(db->sqlite));
+			(void) sqlite3_reset(stmt);
+			return (EIO);
+		}
+	}
+
 	if (have_object && have_name) {
 		char *fp = NULL;
 		int rrc;
@@ -2220,11 +2340,267 @@ zmetad_db_bump_purge_epoch(zmetad_db_t *db, const char *dataset)
 }
 
 /*
+ * S3 object-tagging limits (the pinned contract): at most 10 tags
+ * per object, keys at most 128 characters, values at most 256
+ * bytes.  Enforced here, in the single tags write path.
+ */
+#define	ZMETAD_TAG_MAX_TAGS	10
+#define	ZMETAD_TAG_MAX_KEY	128	/* characters */
+#define	ZMETAD_TAG_MAX_VALUE	256	/* bytes */
+
+/*
+ * Set an object's tag set to exactly "tags" (nvlist of string
+ * pairs) in ONE transaction: BEGIN IMMEDIATE, INSERT OR REPLACE
+ * every pair, DELETE the keys the new set drops, COMMIT.  Rejects
+ * an empty set, more than 10 tags, a key over 128 characters, a
+ * value over 256 bytes, a NULL/empty key or a non-string pair with
+ * EINVAL and a named reason, and writes nothing in that case (the
+ * limits are checked BEFORE the transaction opens).
+ *
+ * captured_at is unix seconds, the events.captured_at convention.
+ *
+ * RENAME needs no lifetime action here: object_id is stable across
+ * renames and tags key on (dataset, object_id), not on the name.
+ */
+int
+zmetad_db_tag_set(zmetad_db_t *db, const char *dataset,
+    unsigned long long object_id, const nvlist_t *tags)
+{
+	sqlite3_stmt *stmt;
+	nvpair_t *pair = NULL;
+	uint_t ntags = 0;
+	int rc;
+
+	if (db == NULL || dataset == NULL || dataset[0] == '\0' ||
+	    tags == NULL)
+		return (EINVAL);
+
+	/*
+	 * Validate the whole set up front: a rejection must leave the
+	 * stored set untouched, so the limits cannot be enforced
+	 * mid-transaction.
+	 */
+	while ((pair = nvlist_next_nvpair((nvlist_t *)tags, pair)) !=
+	    NULL) {
+		const char *val;
+
+		if (nvpair_type(pair) != DATA_TYPE_STRING) {
+			db_warn(db, "tag '%s': value is not a string\n",
+			    nvpair_name(pair));
+			return (EINVAL);
+		}
+		if (strlen(nvpair_name(pair)) == 0) {
+			db_warn(db, "tag key is empty\n");
+			return (EINVAL);
+		}
+		if (strlen(nvpair_name(pair)) > ZMETAD_TAG_MAX_KEY) {
+			db_warn(db, "tag key longer than %d characters: "
+
+			    "%s\n", ZMETAD_TAG_MAX_KEY, nvpair_name(pair));
+			return (EINVAL);
+		}
+		rc = nvpair_value_string(pair, &val);
+		if (rc != 0 || val == NULL) {
+			db_warn(db, "tag '%s': cannot read value\n",
+			    nvpair_name(pair));
+			return (EINVAL);
+		}
+		if (strlen(val) > ZMETAD_TAG_MAX_VALUE) {
+			db_warn(db, "tag '%s': value longer than %d "
+
+			    "bytes\n", nvpair_name(pair),
+			    ZMETAD_TAG_MAX_VALUE);
+			return (EINVAL);
+		}
+		ntags++;
+	}
+	if (ntags == 0) {
+		db_warn(db, "tag set is empty; use tag clear to remove "
+
+		    "all tags\n");
+		return (EINVAL);
+	}
+	if (ntags > ZMETAD_TAG_MAX_TAGS) {
+		db_warn(db, "tag set has %u tags; at most %d are "
+
+		    "allowed\n", ntags, ZMETAD_TAG_MAX_TAGS);
+		return (EINVAL);
+	}
+
+	rc = zmetad_db_begin(db);
+	if (rc != 0)
+		return (rc);
+
+	/*
+	 * Replace the whole set: drop every stored row for the object
+	 * first, then insert the new keys, all inside the one
+	 * transaction.  Deleting per-key AFTER the inserts would be
+	 * wrong twice over -- it would remove the rows just written
+	 * (the delete matches the new keys) and would leave stale keys
+	 * from the old set in place.
+	 */
+	rc = sqlite3_prepare_v2(db->sqlite, tag_del_obj_sql, -1, &stmt,
+	    NULL);
+	if (rc != SQLITE_OK)
+		goto err;
+	rc = sqlite3_bind_text(stmt, 1, dataset, -1, SQLITE_STATIC);
+	if (rc == SQLITE_OK)
+		rc = sqlite3_bind_int64(stmt, 2, (sqlite3_int64)object_id);
+	if (rc == SQLITE_OK)
+		rc = sqlite3_step(stmt);
+	(void) sqlite3_finalize(stmt);
+	if (rc != SQLITE_DONE)
+		goto err;
+
+	pair = NULL;
+	while ((pair = nvlist_next_nvpair((nvlist_t *)tags, pair))
+	    != NULL) {
+		const char *val = NULL;
+
+		(void) nvpair_value_string(pair, &val);
+		rc = sqlite3_prepare_v2(db->sqlite, tag_put_sql, -1,
+		    &stmt, NULL);
+		if (rc != SQLITE_OK)
+			goto err;
+		rc = sqlite3_bind_text(stmt, 1, dataset, -1,
+		    SQLITE_STATIC);
+		if (rc == SQLITE_OK)
+			rc = sqlite3_bind_int64(stmt, 2,
+			    (sqlite3_int64)object_id);
+		if (rc == SQLITE_OK)
+			rc = sqlite3_bind_text(stmt, 3,
+			    nvpair_name(pair), -1, SQLITE_STATIC);
+		if (rc == SQLITE_OK)
+			rc = sqlite3_bind_text(stmt, 4, val, -1,
+			    SQLITE_TRANSIENT);
+		if (rc == SQLITE_OK)
+			rc = sqlite3_bind_int64(stmt, 5,
+			    (sqlite3_int64)time(NULL));
+		if (rc == SQLITE_OK)
+			rc = sqlite3_step(stmt);
+		(void) sqlite3_finalize(stmt);
+		if (rc != SQLITE_DONE)
+			goto err;
+	}
+
+	rc = zmetad_db_commit(db);
+	if (rc != 0) {
+		(void) zmetad_db_rollback(db);
+		return (rc);
+	}
+	return (0);
+
+err:
+	db_warn(db, "tag set for %s object %llu: %s\n", dataset,
+	    object_id, sqlite3_errmsg(db->sqlite));
+	(void) zmetad_db_rollback(db);
+	return (EIO);
+}
+
+/*
+ * All tag pairs for (dataset, object_id) as a string:string nvlist.
+ * Returns 0 with an EMPTY nvlist when the object has no tags (not
+ * an error); *out is NULL only on error.  Caller frees with
+ * fnvlist_free().
+ */
+int
+zmetad_db_tag_get(zmetad_db_t *db, const char *dataset,
+    unsigned long long object_id, nvlist_t **out)
+{
+	sqlite3_stmt *stmt = NULL;
+	nvlist_t *result;
+	int rc;
+
+	*out = NULL;
+
+	if (db == NULL || dataset == NULL || dataset[0] == '\0')
+		return (EINVAL);
+
+	rc = sqlite3_prepare_v2(db->sqlite, tag_get_sql, -1, &stmt,
+	    NULL);
+	if (rc != SQLITE_OK)
+		return (EIO);
+
+	result = fnvlist_alloc();
+	if (result == NULL) {
+		(void) sqlite3_finalize(stmt);
+		return (ENOMEM);
+	}
+
+	rc = sqlite3_bind_text(stmt, 1, dataset, -1, SQLITE_STATIC);
+	if (rc == SQLITE_OK)
+		rc = sqlite3_bind_int64(stmt, 2,
+		    (sqlite3_int64)object_id);
+	if (rc == SQLITE_OK) {
+		while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+			const unsigned char *key =
+			    sqlite3_column_text(stmt, 0);
+			const unsigned char *val =
+			    sqlite3_column_text(stmt, 1);
+
+			if (key == NULL || val == NULL)
+				continue;
+			/*
+			 * Keys are validated at tag-set time (<= 128
+			 * chars, unique), so fnvlist_add_string cannot
+			 * collide here.
+			 */
+			fnvlist_add_string(result,
+			    (const char *)key, (const char *)val);
+		}
+	}
+	(void) sqlite3_finalize(stmt);
+	if (rc != SQLITE_DONE) {
+		fnvlist_free(result);
+		return (EIO);
+	}
+
+	*out = result;
+	return (0);
+}
+
+/*
+ * Delete every tag row for (dataset, object_id).  Idempotent like
+ * the S3 clear-all: 0 even when none existed.
+ */
+int
+zmetad_db_tag_clear(zmetad_db_t *db, const char *dataset,
+    unsigned long long object_id)
+{
+	sqlite3_stmt *stmt = db->tag_del_obj_stmt;
+	int rc;
+
+	if (db == NULL || dataset == NULL || dataset[0] == '\0')
+		return (EINVAL);
+
+	rc = sqlite3_reset(stmt);
+	if (rc != SQLITE_OK) {
+		db_warn(db, "Tag clear reset error: %s\n",
+		    sqlite3_errmsg(db->sqlite));
+		return (EIO);
+	}
+	rc = sqlite3_bind_text(stmt, 1, dataset, -1, SQLITE_STATIC);
+	if (rc == SQLITE_OK)
+		rc = sqlite3_bind_int64(stmt, 2,
+		    (sqlite3_int64)object_id);
+	if (rc == SQLITE_OK)
+		rc = sqlite3_step(stmt);
+	(void) sqlite3_reset(stmt);
+	if (rc != SQLITE_DONE) {
+		db_warn(db, "Tag clear error for %s: %s\n", dataset,
+		    sqlite3_errmsg(db->sqlite));
+		return (EIO);
+	}
+	return (0);
+}
+
+/*
  * Delete every row belonging to "dataset" from the events, gaps,
- * sync_state and objmap tables in ONE transaction: a midway failure
- * rolls all four deletes back instead of leaving events gone while
- * gaps/sync_state/objmap survive.  Row counts are returned through
- * the caller's array (events, gaps, sync_state, objmap order).
+ * sync_state, objmap and tags tables in ONE transaction: a midway
+ * failure rolls all five deletes back instead of leaving events
+ * gone while gaps/sync_state/objmap/tags survive.  Row counts are
+ * returned through the caller's array (events, gaps, sync_state,
+ * objmap order; the tags delete is not one of the reported counts).
  */
 int
 zmetad_db_purge_dataset(zmetad_db_t *db, const char *dataset,
@@ -2240,7 +2616,8 @@ zmetad_db_purge_dataset(zmetad_db_t *db, const char *dataset,
 	if (rc != 0)
 		return (rc);
 
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < (int)(sizeof (purge_dataset_sql) /
+	    sizeof (purge_dataset_sql[0])); i++) {
 		rc = sqlite3_prepare_v2(db->sqlite, purge_dataset_sql[i],
 		    -1, &stmt, NULL);
 		if (rc != SQLITE_OK) {
@@ -2265,11 +2642,11 @@ zmetad_db_purge_dataset(zmetad_db_t *db, const char *dataset,
 			(void) zmetad_db_rollback(db);
 			return (EIO);
 		}
-		counts[i] = sqlite3_changes(db->sqlite);
+		if (i < 4)
+			counts[i] = sqlite3_changes(db->sqlite);
 		(void) sqlite3_finalize(stmt);
 		stmt = NULL;
 	}
-
 	rc = zmetad_db_commit(db);
 	if (rc != 0) {
 		(void) zmetad_db_rollback(db);
