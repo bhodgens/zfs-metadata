@@ -171,6 +171,9 @@ config_init(zmetad_config_t *cfg)
 	cfg->export_schema_path = NULL;
 	cfg->check_schema_path = NULL;
 	cfg->purge_dataset = NULL;
+	cfg->query_dataset = NULL;
+	cfg->query_since_id = 0;
+	cfg->query_max_events = ZMETAD_DEFAULT_MAX_EVENTS;
 	cfg->force = B_FALSE;
 	cfg->spool_path[0] = '\0';
 	cfg->spool_enabled = B_FALSE;
@@ -378,6 +381,53 @@ run_purge(const zmetad_config_t *cfg)
 
 	printf("purged %s: %lld events, %lld gaps removed; "
 	    "kernel ring cleared\n", ds, counts[0], counts[1]);
+	return (0);
+}
+
+/*
+ * One-shot mode: print a dataset's stored events past the consumer's
+ * since-id cursor as NDJSON on stdout (SCHEMA.md Section 8.5).
+ * Read-only: the database is opened read-only and never migrated or
+ * stamped, so this can run against a database a live daemon owns.
+ *
+ * No libzfs and no schema here: main() dispatches this before
+ * libzfs_init() and the schema load, so a consumer can read exports
+ * on a host where /dev/zfs is unavailable.
+ */
+static int
+run_query(const zmetad_config_t *cfg)
+{
+	zmetad_db_t *db = NULL;
+	unsigned long long returned = 0;
+	unsigned long long last_id = 0;
+	boolean_t truncated = B_FALSE;
+	boolean_t loss_seen = B_FALSE;
+	int err;
+
+	err = zmetad_db_open_readonly(&db, cfg->db_path);
+	if (err != 0)
+		return (1);
+
+	err = zmetad_db_query_events(db, cfg->query_dataset,
+	    cfg->query_since_id, cfg->query_max_events, stdout,
+	    &returned, &last_id, &truncated, &loss_seen);
+	zmetad_db_close(db);
+	if (err != 0) {
+		fprintf(stderr, "cannot query %s: %s\n", cfg->query_dataset,
+		    strerror(err));
+		return (1);
+	}
+
+	if (truncated) {
+		fprintf(stderr, "truncated: resume with --since-id %llu\n",
+		    last_id);
+	}
+	if (loss_seen) {
+		fprintf(stderr, "warning: loss gaps recorded for %s; some "
+		    "events were never captured -- a full rescan is "
+		    "recommended\n", cfg->query_dataset);
+	}
+
 	return (0);
 }
 
@@ -1462,6 +1512,17 @@ usage(const char *progname)
 	    "events/gaps/sync_state rows,\n");
 	fprintf(stderr, "                         clear its kernel event "
 	    "ring, and exit\n");
+	fprintf(stderr, "  --query <dataset>      Print the dataset's "
+	    "stored events as NDJSON and\n");
+	fprintf(stderr, "                         exit (never enters the "
+	    "polling loop)\n");
+	fprintf(stderr, "  --since-id <id>        With --query: only rows "
+	    "with id greater than <id>\n");
+	fprintf(stderr, "                         (default: 0)\n");
+	fprintf(stderr, "  --max-events <count>   With --query: return at "
+	    "most <count> rows\n");
+	fprintf(stderr, "                         (default: %d)\n",
+	    ZMETAD_DEFAULT_MAX_EVENTS);
 	fprintf(stderr, "  --force                Allow --export-schema to "
 	    "overwrite existing file\n");
 	fprintf(stderr, "  -v, --verbose          Verbose output\n");
@@ -1474,6 +1535,9 @@ static struct option longopts[] = {
 	{ "export-schema",	required_argument,	NULL,	'e' },
 	{ "check-schema",	required_argument,	NULL,	'k' },
 	{ "purge",		required_argument,	NULL,	'p' },
+	{ "query",		required_argument,	NULL,	0x101 },
+	{ "since-id",		required_argument,	NULL,	0x102 },
+	{ "max-events",		required_argument,	NULL,	0x103 },
 	{ "force",		no_argument,		NULL,	0x100 },
 	{ "foreground",		no_argument,		NULL,	'f' },
 	{ "interval",		required_argument,	NULL,	'i' },
@@ -1601,6 +1665,72 @@ main(int argc, char **argv)
 		case 0x100:
 			g_config.force = B_TRUE;
 			break;
+		case 0x101:
+			if (g_config.query_dataset != NULL) {
+				fprintf(stderr, "--query given multiple "
+				    "times\n");
+				usage(argv[0]);
+				return (EXIT_FAILURE);
+			}
+			if (optarg[0] == '-') {
+				fprintf(stderr, "--query dataset must not "
+				    "start with '-': %s\n", optarg);
+				usage(argv[0]);
+				return (EXIT_FAILURE);
+			}
+			g_config.query_dataset = optarg;
+			break;
+		case 0x102: {
+			char *endptr = NULL;
+
+			errno = 0;
+			g_config.query_since_id = strtoull(optarg,
+			    &endptr, 10);
+			/*
+			 * First char must be a digit: strtoull
+			 * otherwise accepts leading whitespace and
+			 * negates a '-' sign (" -1" becomes
+			 * ULLONG_MAX, which the db layer's signed
+			 * bind turns back into -1, i.e. all rows).
+			 */
+			if (optarg[0] < '0' || optarg[0] > '9' ||
+			    endptr == optarg || *endptr != '\0' ||
+			    errno == ERANGE) {
+				fprintf(stderr, "invalid --since-id "
+				    "'%s': expected a non-negative "
+				    "integer\n", optarg);
+				usage(argv[0]);
+				return (EXIT_FAILURE);
+			}
+			break;
+		}
+		case 0x103: {
+			char *endptr = NULL;
+
+			errno = 0;
+			g_config.query_max_events = strtoull(optarg,
+			    &endptr, 10);
+			/* Digit-first guard: see --since-id above. */
+			if (optarg[0] < '0' || optarg[0] > '9' ||
+			    endptr == optarg || *endptr != '\0' ||
+			    errno == ERANGE) {
+				fprintf(stderr, "invalid --max-events "
+				    "'%s': expected a positive "
+				    "integer\n", optarg);
+				usage(argv[0]);
+				return (EXIT_FAILURE);
+			}
+			if (g_config.query_max_events == 0 ||
+			    g_config.query_max_events >
+			    ZMETAD_MAX_QUERY_EVENTS) {
+				fprintf(stderr, "invalid --max-events "
+				    "'%s': expected 1..%llu\n", optarg,
+				    (u_longlong_t)ZMETAD_MAX_QUERY_EVENTS);
+				usage(argv[0]);
+				return (EXIT_FAILURE);
+			}
+			break;
+		}
 		case 'f':
 			g_config.foreground = B_TRUE;
 			break;
@@ -1708,6 +1838,24 @@ main(int argc, char **argv)
 		fprintf(stderr, "schema path must not start with '-'\n");
 		usage(argv[0]);
 		return (EXIT_FAILURE);
+	}
+
+	/*
+	 * --since-id and --max-events are modifiers of --query: a
+	 * stray one is a mangled invocation, not a daemon start.
+	 */
+	if ((g_config.query_since_id != 0 ||
+	    g_config.query_max_events != ZMETAD_DEFAULT_MAX_EVENTS) &&
+	    g_config.query_dataset == NULL) {
+		fprintf(stderr, "--since-id and --max-events require "
+		    "--query\n");
+		usage(argv[0]);
+		return (EXIT_FAILURE);
+	}
+
+	/* One-shot query mode: needs no libzfs and no schema */
+	if (g_config.query_dataset != NULL) {
+		return (run_query(&g_config));
 	}
 
 	/* One-shot schema modes: run and exit before any daemon setup */
