@@ -1,4 +1,4 @@
-<abi-corpus version='2.2' architecture='elf-amd-x86_64' soname='libnvpair.so.3'>
+<abi-corpus version='2.0' architecture='elf-amd-x86_64' soname='libnvpair.so.3'>
   <elf-needed>
     <dependency name='libtirpc.so.3'/>
     <dependency name='libc.so.6'/>
@@ -486,12 +486,12 @@
       <subrange length='unknown' lower-bound='0' upper-bound='0' type-id='f0981eeb' id='031f2035'/>
     </array-type-def>
     <type-decl name='double' size-in-bits='64' id='a0eb0f08'/>
-    <enum-decl name='boolean_t' naming-typedef-id='c19b74c3' id='f58c8277'>
+    <enum-decl name='boolean_t' id='f58c8277'>
       <underlying-type type-id='9cac1fee'/>
       <enumerator name='B_FALSE' value='0'/>
       <enumerator name='B_TRUE' value='1'/>
     </enum-decl>
-    <enum-decl name='data_type_t' naming-typedef-id='8d0687d2' id='aeeae136'>
+    <enum-decl name='data_type_t' id='aeeae136'>
       <underlying-type type-id='9cac1fee'/>
       <enumerator name='DATA_TYPE_DONTCARE' value='-1'/>
       <enumerator name='DATA_TYPE_UNKNOWN' value='0'/>
@@ -824,7 +824,7 @@
         <var-decl name='newline_anchor' type-id='f0981eed' visibility='default'/>
       </data-member>
     </class-decl>
-    <class-decl name='regmatch_t' size-in-bits='64' is-struct='yes' naming-typedef-id='1b941664' visibility='default' id='4f932615'>
+    <class-decl name='regmatch_t' size-in-bits='64' is-struct='yes' visibility='default' id='4f932615'>
       <data-member access='public' layout-offset-in-bits='0'>
         <var-decl name='rm_so' type-id='54a2a2a8' visibility='default'/>
       </data-member>
@@ -1823,7 +1823,7 @@
     <array-type-def dimensions='1' type-id='a84c031d' size-in-bits='32' id='8e0573fd'>
       <subrange length='4' lower-bound='0' upper-bound='3' type-id='f0981eeb' id='16fe7105'/>
     </array-type-def>
-    <class-decl name='__mbstate_t' size-in-bits='64' is-struct='yes' naming-typedef-id='55e5b2b5' visibility='default' id='87447a2e'>
+    <class-decl name='__mbstate_t' size-in-bits='64' is-struct='yes' visibility='default' id='87447a2e'>
       <data-member access='public' layout-offset-in-bits='0'>
         <var-decl name='__count' type-id='95e97e5e' visibility='default'/>
       </data-member>
@@ -2496,7 +2496,7 @@
     <typedef-decl name='pthread_condattr_t' type-id='33dd3aad' id='836265dd'/>
     <typedef-decl name='pthread_mutex_t' type-id='70681f9b' id='7a6844eb'/>
     <typedef-decl name='pthread_t' type-id='f0981eeb' id='4051f5e7'/>
-    <union-decl name='__atomic_wide_counter' size-in-bits='64' naming-typedef-id='f3b40860' visibility='default' id='613ce450'>
+    <union-decl name='__atomic_wide_counter' size-in-bits='64' visibility='default' id='613ce450'>
       <data-member access='public'>
         <var-decl name='__value64' type-id='f0981eee' visibility='default'/>
       </data-member>
@@ -2504,7 +2504,7 @@
         <var-decl name='__value32' type-id='e7f43f8b' visibility='default'/>
       </data-member>
     </union-decl>
-    <union-decl name='pthread_cond_t' size-in-bits='384' naming-typedef-id='62fab762' visibility='default' id='cbb12c12'>
+    <union-decl name='pthread_cond_t' size-in-bits='384' visibility='default' id='cbb12c12'>
       <data-member access='public'>
         <var-decl name='__data' type-id='c987b47c' visibility='default'/>
       </data-member>
@@ -2515,7 +2515,7 @@
         <var-decl name='__align' type-id='95e97e60' visibility='default'/>
       </data-member>
     </union-decl>
-    <union-decl name='pthread_condattr_t' size-in-bits='32' naming-typedef-id='836265dd' visibility='default' id='33dd3aad'>
+    <union-decl name='pthread_condattr_t' size-in-bits='32' visibility='default' id='33dd3aad'>
       <data-member access='public'>
         <var-decl name='__size' type-id='8e0573fd' visibility='default'/>
       </data-member>
@@ -2523,7 +2523,7 @@
         <var-decl name='__align' type-id='95e97e5e' visibility='default'/>
       </data-member>
     </union-decl>
-    <union-decl name='pthread_mutex_t' size-in-bits='320' naming-typedef-id='7a6844eb' visibility='default' id='70681f9b'>
+    <union-decl name='pthread_mutex_t' size-in-bits='320' visibility='default' id='70681f9b'>
       <data-member access='public'>
         <var-decl name='__data' type-id='4c734837' visibility='default'/>
       </data-member>
@@ -3125,7 +3125,7 @@
   </abi-instr>
   <abi-instr address-size='64' path='lib/libspl/mutex.c' language='LANG_C99'>
     <typedef-decl name='pthread_mutexattr_t' type-id='7300eb00' id='8afd6070'/>
-    <union-decl name='pthread_mutexattr_t' size-in-bits='32' naming-typedef-id='8afd6070' visibility='default' id='7300eb00'>
+    <union-decl name='pthread_mutexattr_t' size-in-bits='32' visibility='default' id='7300eb00'>
       <data-member access='public'>
         <var-decl name='__size' type-id='8e0573fd' visibility='default'/>
       </data-member>
@@ -3605,7 +3605,7 @@
     <typedef-decl name='krwlock_t' type-id='4361e3b2' id='477df69a'/>
     <typedef-decl name='pthread_rwlock_t' type-id='981886f6' id='3f680bc6'/>
     <typedef-decl name='pthread_rwlockattr_t' type-id='b8e57521' id='1b1c4591'/>
-    <union-decl name='pthread_rwlock_t' size-in-bits='448' naming-typedef-id='3f680bc6' visibility='default' id='981886f6'>
+    <union-decl name='pthread_rwlock_t' size-in-bits='448' visibility='default' id='981886f6'>
       <data-member access='public'>
         <var-decl name='__data' type-id='afe414a4' visibility='default'/>
       </data-member>
@@ -3616,7 +3616,7 @@
         <var-decl name='__align' type-id='95e97e5f' visibility='default'/>
       </data-member>
     </union-decl>
-    <union-decl name='pthread_rwlockattr_t' size-in-bits='64' naming-typedef-id='1b1c4591' visibility='default' id='b8e57521'>
+    <union-decl name='pthread_rwlockattr_t' size-in-bits='64' visibility='default' id='b8e57521'>
       <data-member access='public'>
         <var-decl name='__size' type-id='8e100159' visibility='default'/>
       </data-member>

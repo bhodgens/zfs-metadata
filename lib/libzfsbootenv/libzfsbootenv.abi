@@ -1,4 +1,4 @@
-<abi-corpus version='2.2' architecture='elf-amd-x86_64' soname='libzfsbootenv.so.1'>
+<abi-corpus version='2.0' architecture='elf-amd-x86_64' soname='libzfsbootenv.so.1'>
   <elf-needed>
     <dependency name='libzfs.so.7'/>
     <dependency name='libnvpair.so.3'/>
@@ -22,7 +22,7 @@
     <array-type-def dimensions='1' type-id='a84c031d' size-in-bits='160' id='664ac0b7'>
       <subrange length='20' lower-bound='0' upper-bound='19' type-id='f0981eeb' id='fdca39cf'/>
     </array-type-def>
-    <enum-decl name='boolean_t' naming-typedef-id='c19b74c3' id='f58c8277'>
+    <enum-decl name='boolean_t' id='f58c8277'>
       <underlying-type type-id='9cac1fee'/>
       <enumerator name='B_FALSE' value='0'/>
       <enumerator name='B_TRUE' value='1'/>
