@@ -30,6 +30,11 @@
 .Op Fl -query Ar dataset
 .Op Fl -since-id Ar id
 .Op Fl -max-events Ar count
+.Op Fl -tag-set Ar dataset
+.Op Fl -tag-get Ar dataset
+.Op Fl -tag-clear Ar dataset
+.Op Fl -tag-object Ar id
+.Op Fl -tag Ar key Ns = Ns Ar value
 .Op Fl -export-schema Ar file
 .Op Fl -check-schema Ar file
 .Op Fl -force
@@ -210,6 +215,96 @@ rows before truncating (see
 above).
 Default: 1000.
 Maximum: 100000000; zero and values above the maximum are rejected.
+.It Fl -tag-set Ar dataset
+One-shot tag mode: instead of running the daemon, replace the whole
+tag set of the object selected by
+.Fl -tag-object
+(see below) in
+.Ar dataset
+with the
+.Fl -tag
+pairs given on the command line, and exit.
+The one-shot modes
+.Fl -purge ,
+.Fl -query ,
+and the tag modes are mutually exclusive.
+Replacement is S3
+.Sy PutObjectTagging
+semantics, never a merge: the object's stored tags are deleted and
+the new set inserted in one transaction, so keys the new set drops
+are gone after a successful set.
+S3 limits are enforced, and a violating set is rejected with the
+stored set left untouched (the whole set is validated before
+anything is written): at most 10 tags per object, keys at most 128
+characters, values at most 256 bytes; an empty key, a non-string
+value, or an empty set (a
+.Fl -tag-set
+without
+.Fl -tag )
+is rejected.
+Unlike
+.Fl -query ,
+these modes create and migrate the database if it does not exist.
+Exit status is 0 on success and 1 on a database, limit, or usage
+error.
+.It Fl -tag-get Ar dataset
+One-shot tag mode: print every tag pair stored for the object
+selected by
+.Fl -tag-object
+in
+.Ar dataset ,
+one
+.Sy key Ns = Ns Ar value
+line per pair on standard output, and exit.
+Zero pairs is an empty result, not an error: a never-tagged object
+reads the same as a cleared one.
+Exit status is 0 on success (an empty result is not an error) and 1
+on a database or usage error.
+.It Fl -tag-clear Ar dataset
+One-shot tag mode: delete every tag pair stored for the object
+selected by
+.Fl -tag-object
+in
+.Ar dataset ,
+and exit.
+Idempotent: clearing an object that has no tags succeeds.
+Exit status is 0 on success and 1 on a database or usage error.
+.It Fl -tag-object Ar id
+With
+.Fl -tag-set ,
+.Fl -tag-get ,
+or
+.Fl -tag-clear ,
+select the object the mode operates on.
+This is the same object id the
+.Sy events
+rows carry in their
+.Sy object_id
+column.
+Tags key on
+.Sy dataset
+and
+.Sy object_id ,
+never on the object's name, so a RENAME needs no tag action, while a
+REMOVE event for the object deletes its tags.
+Non-numeric values are rejected.
+.It Fl -tag Ar key Ns = Ns Ar value
+With
+.Fl -tag-set ,
+one pair of the new set; repeatable.
+The first
+.Ql =
+splits the pair:
+.Ar key
+is everything before it and
+.Ar value
+everything after it, so a value may itself contain
+.Ql = .
+A
+.Fl -tag
+without
+.Ql =
+is a usage error.
 .It Fl -export-schema Ar file
 One-shot mode: write the embedded canonical event schema JSON to
 .Ar file
@@ -397,13 +492,14 @@ The SQLite database layout version is recorded in the
 .Sy meta
 table under the
 .Sy db_schema_version
-key; this build writes layout version 8.
-The database contains six tables:
+key; this build writes layout version 9.
+The database contains seven tables:
 .Sy events ,
 .Sy sync_state ,
 .Sy datasets ,
 .Sy gaps ,
 .Sy objmap ,
+.Sy tags ,
 and
 .Sy meta .
 The full column-by-column contract, including the
@@ -490,6 +586,34 @@ database; only
 .Fl -purge
 removes them.
 Exact loss-accounting formulas are defined in
+.Pa contrib/zmetad/SCHEMA.md .
+.Ss Tags Table
+.Bd -literal -offset indent
+CREATE TABLE tags (
+    dataset TEXT NOT NULL,
+    object_id INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    captured_at INTEGER NOT NULL,
+    PRIMARY KEY (dataset, object_id, key)
+);
+CREATE INDEX idx_tags_dataset ON tags(dataset);
+.Ed
+.Pp
+S3-style object tags: string:string key/value pairs a consumer
+attaches to an object.
+Tags are consumers' application data written through the tag CLI,
+not kernel-record data.
+Setting an object's tags replaces its whole set in one transaction
+(S3 PutObjectTagging semantics, never a merge); the S3 limits apply
+(at most 10 tags per object, keys at most 128 characters, values at
+most 256 bytes) and a rejected set leaves the stored set untouched.
+Lifetime: a REMOVE event deletes the object's tags in the same batch
+transaction,
+.Fl -purge
+removes the dataset's tags with everything else, retention never
+ages them, and a RENAME needs no action (object_id is stable).
+The full contract is section 2.7 of
 .Pa contrib/zmetad/SCHEMA.md .
 .
 .Sh QUERY EXAMPLES
