@@ -43,6 +43,14 @@ extern "C" {
 #define	ZMETAD_MAX_QUERY_EVENTS		100000000
 
 /*
+ * One-shot --tag-set/--tag-get/--tag-clear knobs (issue #13).  The
+ * pair slots bound the repeatable --tag key=value array at parse
+ * time; the storage contract's own limit (10 tags, see
+ * zmetad_db_tag_set) is tighter and still authoritative.
+ */
+#define	ZMETAD_TAG_MAX_PAIRS		16
+
+/*
  * Configuration file: parsed by zmetad_conf.c when present.  A
  * missing file is not an error; an invalid one is fatal at startup.
  */
@@ -52,6 +60,18 @@ extern "C" {
 #define	ZMETAD_SPOOL_DEFAULT_BYTES	(64 * 1024 * 1024)	/* 64 MB */
 #define	ZMETAD_SPOOL_MIN_BYTES		(1024 * 1024)		/* 1 MB */
 #define	ZMETAD_SPOOL_MAX_BYTES		(1024 * 1024 * 1024)	/* 1 GB */
+
+/*
+ * One-shot --tag-set/--tag-get/--tag-clear mode selector (see
+ * zmetad_config_t).  All three take a dataset argument and key on
+ * (dataset, object_id).
+ */
+typedef enum {
+	ZMETAD_TAG_MODE_NONE = 0,
+	ZMETAD_TAG_MODE_SET,
+	ZMETAD_TAG_MODE_GET,
+	ZMETAD_TAG_MODE_CLEAR
+} zmetad_tag_mode_t;
 
 /* Configuration structure */
 typedef struct zmetad_config {
@@ -72,6 +92,20 @@ typedef struct zmetad_config {
 	char		*query_dataset;
 	unsigned long long query_since_id;	/* --since-id, default 0 */
 	unsigned long long query_max_events;	/* --max-events, default 1000 */
+	/*
+	 * One-shot --tag-set/--tag-get/--tag-clear mode (issue #13):
+	 * which of the three was given (exactly one; ZMETAD_TAG_MODE_
+	 * NONE means none), the object id they all require, and the
+	 * repeatable --tag key=value pairs (--tag-set only).  Pairs
+	 * are parsed at the FIRST '='; more than
+	 * ZMETAD_TAG_MAX_PAIRS is a CLI error (the DB layer's own
+	 * 10-tag limit remains the binding one).
+	 */
+	zmetad_tag_mode_t tag_mode;
+	char		*tag_dataset;
+	unsigned long long tag_object_id;	/* --tag-object, default 0 */
+	char		*tag_pairs[ZMETAD_TAG_MAX_PAIRS];
+	int		tag_pair_count;
 	boolean_t	force;
 	/*
 	 * Spool (NDJSON export) settings, leaf-01 contract: appended,
