@@ -34,6 +34,7 @@ check_PROGRAMS = zmetad_schema_test
 zmetad_schema_test_SOURCES = \
 	%D%/zmetad_schema_test.c \
 	%D%/zmetad_conf.c \
+	%D%/zmetad_db.c \
 	%D%/zmetad_schema.c \
 	%D%/zmetad_schema.h \
 	%D%/zmetad_spool.c \
@@ -46,7 +47,11 @@ zmetad_schema_test_SOURCES += \
 	$(top_srcdir)/lib/libspl/strlcpy.c \
 	$(top_srcdir)/lib/libspl/strlcat.c
 
-zmetad_schema_test_LDADD = libnvpair.la
+# The DB-layer tests pull in zmetad_db.c: SQLite flags for the
+# compile, SQLite + the libtool wrappers for the link (same set the
+# zmetad binary itself uses).
+zmetad_schema_test_CFLAGS = $(zmetad_CFLAGS)
+zmetad_schema_test_LDADD = libnvpair.la $(LIBSQLITE3_LIBS)
 
 # Run the parser test under "make check".
 TESTS = zmetad_schema_test

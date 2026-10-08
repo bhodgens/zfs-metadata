@@ -25,6 +25,7 @@
 #include <limits.h>
 #include <sys/stat.h>
 
+#include <sqlite3.h>
 #include <libnvpair.h>
 
 #include "zmetad.h"
@@ -769,6 +770,243 @@ run_conf_tests(void)
 	(void) rmdir(dir);
 }
 
+/*
+ * Database layer (issue #13 phase 1): exercise the tags table, the
+ * tag-set API and its lifetime coupling against a real SQLite
+ * database in a temp directory.  Loads its own schema because the
+ * parser tests freed theirs.
+ */
+static void
+run_db_tests(void)
+{
+	char dir[] = "/tmp/zmetad_db_test_XXXXXX";
+	char path[PATH_MAX];
+	zmetad_schema_t *zs;
+	zmetad_db_t *db = NULL;
+	nvlist_t *tags;
+	nvpair_t *pair;
+	char errbuf[256];
+	uint_t n;
+
+	if (mkdtemp(dir) == NULL) {
+		fprintf(stderr, "FAIL: mkdtemp db: %s\\n", strerror(errno));
+		g_fail = 1;
+		return;
+	}
+	(void) snprintf(path, sizeof (path), "%s/zmetad.db", dir);
+
+	zs = zmetad_schema_load(NULL, errbuf);
+	if (zs == NULL) {
+		fprintf(stderr, "FAIL: db: schema load: %s\\n", errbuf);
+		g_fail = 1;
+		(void) rmdir(dir);
+		return;
+	}
+
+	if (zmetad_db_open(&db, path, zs) != 0) {
+		fprintf(stderr, "FAIL: db open\\n");
+		g_fail = 1;
+		zmetad_schema_free(zs);
+		(void) rmdir(dir);
+		return;
+	}
+
+	/*
+	 * Layout 9 stamp (issue #13): read the meta table directly
+	 * through sqlite3 (the db-layer meta reader is internal), and
+	 * prove a reopen validates the stored layout.
+	 */
+	{
+		sqlite3 *raw = NULL;
+		sqlite3_stmt *st = NULL;
+		const char *sql =
+		    "SELECT value FROM meta WHERE key = 'db_schema_version'";
+
+		REQUIRE(sqlite3_open(path, &raw) == SQLITE_OK);
+		REQUIRE(sqlite3_prepare_v2(raw, sql, -1, &st, NULL)
+		    == SQLITE_OK);
+		REQUIRE(sqlite3_step(st) == SQLITE_ROW);
+		REQUIRE(strcmp((const char *)sqlite3_column_text(st, 0),
+		    "9") == 0);
+		sqlite3_finalize(st);
+		sqlite3_close(raw);
+
+		REQUIRE(zmetad_db_open(&db, path, zs) == 0);
+		zmetad_db_close(db);
+		REQUIRE(zmetad_db_open(&db, path, zs) == 0);
+	}
+
+	/* Empty get is an empty nvlist, not an error. */
+	REQUIRE(zmetad_db_tag_get(db, "tank/a", 42, &tags) == 0);
+	REQUIRE(tags != NULL && nvlist_empty(tags));
+	fnvlist_free(tags);
+
+	/* Empty set is refused: S3 requires at least one tag. */
+	tags = fnvlist_alloc();
+	REQUIRE(zmetad_db_tag_set(db, "tank/a", 42, tags) == EINVAL);
+	fnvlist_free(tags);
+
+	/* Round-trip: set two tags, read them back. */
+	tags = fnvlist_alloc();
+	fnvlist_add_string(tags, "team", "storage");
+	fnvlist_add_string(tags, "env", "prod");
+	REQUIRE(zmetad_db_tag_set(db, "tank/a", 42, tags) == 0);
+	fnvlist_free(tags);
+
+	REQUIRE(zmetad_db_tag_get(db, "tank/a", 42, &tags) == 0);
+	REQUIRE(tags != NULL);
+	n = 0;
+	pair = nvlist_next_nvpair(tags, NULL);
+	while (pair != NULL) {
+		n++;
+		pair = nvlist_next_nvpair(tags, pair);
+	}
+	REQUIRE(n == 2);
+	REQUIRE(fnvlist_lookup_string(tags, "team") != NULL &&
+	    strcmp(fnvlist_lookup_string(tags, "team"), "storage") == 0);
+	REQUIRE(fnvlist_lookup_string(tags, "env") != NULL &&
+	    strcmp(fnvlist_lookup_string(tags, "env"), "prod") == 0);
+	fnvlist_free(tags);
+
+	/* Replace-set semantics: old keys die, new keys live. */
+	tags = fnvlist_alloc();
+	fnvlist_add_string(tags, "tier", "gold");
+	REQUIRE(zmetad_db_tag_set(db, "tank/a", 42, tags) == 0);
+	fnvlist_free(tags);
+
+	REQUIRE(zmetad_db_tag_get(db, "tank/a", 42, &tags) == 0);
+	REQUIRE(nvlist_exists(tags, "tier"));
+	REQUIRE(!nvlist_exists(tags, "team"));
+	REQUIRE(!nvlist_exists(tags, "env"));
+	fnvlist_free(tags);
+
+	/* Limits: 11 tags, 129-char key, 257-byte value. */
+	tags = fnvlist_alloc();
+	for (int i = 0; i < 11; i++) {
+		char k[16];
+
+		(void) snprintf(k, sizeof (k), "key%d", i);
+		fnvlist_add_string(tags, k, "v");
+	}
+	REQUIRE(zmetad_db_tag_set(db, "tank/a", 42, tags) == EINVAL);
+	fnvlist_free(tags);
+
+	{
+		char bigkey[130];
+		char bigval[258];
+
+		(void) memset(bigkey, 'k', sizeof (bigkey) - 1);
+		bigkey[sizeof (bigkey) - 1] = '\0';
+		(void) memset(bigval, 'v', sizeof (bigval) - 1);
+		bigval[sizeof (bigval) - 1] = '\0';
+
+		tags = fnvlist_alloc();
+		fnvlist_add_string(tags, bigkey, "v");
+		REQUIRE(zmetad_db_tag_set(db, "tank/a", 42, tags) ==
+		    EINVAL);
+		fnvlist_free(tags);
+
+		tags = fnvlist_alloc();
+		fnvlist_add_string(tags, "k", bigval);
+		REQUIRE(zmetad_db_tag_set(db, "tank/a", 42, tags) ==
+		    EINVAL);
+		fnvlist_free(tags);
+	}
+
+	/* Non-string pair is refused. */
+	tags = fnvlist_alloc();
+	fnvlist_add_uint64(tags, "k", 7);
+	REQUIRE(zmetad_db_tag_set(db, "tank/a", 42, tags) == EINVAL);
+	fnvlist_free(tags);
+
+	/* The refusals above must not have written anything. */
+	REQUIRE(zmetad_db_tag_get(db, "tank/a", 42, &tags) == 0);
+	REQUIRE(nvlist_exists(tags, "tier") && !nvlist_exists(tags, "k"));
+	fnvlist_free(tags);
+
+	/*
+	 * REMOVE lifetime coupling: inserting a REMOVE event for the
+	 * tagged object deletes its tags in the same batch.
+	 */
+	{
+		nvlist_t *ev = fnvlist_alloc();
+
+		fnvlist_add_uint64(ev, "txg", 100);
+		fnvlist_add_uint64(ev, "time", 1000);
+		fnvlist_add_uint64(ev, "object", 42);
+		fnvlist_add_uint16(ev, "op", 2);	/* REMOVE */
+		REQUIRE(zmetad_db_insert_event(db, "tank/a", ev) == 0);
+		fnvlist_free(ev);
+
+		REQUIRE(zmetad_db_tag_get(db, "tank/a", 42, &tags) == 0);
+		REQUIRE(nvlist_empty(tags));
+		fnvlist_free(tags);
+	}
+
+	/* Non-REMOVE events must NOT delete tags. */
+	{
+		nvlist_t *ev = fnvlist_alloc();
+
+		tags = fnvlist_alloc();
+		fnvlist_add_string(tags, "stay", "yes");
+		REQUIRE(zmetad_db_tag_set(db, "tank/a", 7, tags) == 0);
+		fnvlist_free(tags);
+
+		fnvlist_add_uint64(ev, "txg", 101);
+		fnvlist_add_uint64(ev, "time", 1001);
+		fnvlist_add_uint64(ev, "object", 7);
+		fnvlist_add_uint16(ev, "op", 1);	/* CREATE */
+		REQUIRE(zmetad_db_insert_event(db, "tank/a", ev) == 0);
+		fnvlist_free(ev);
+
+		REQUIRE(zmetad_db_tag_get(db, "tank/a", 7, &tags) == 0);
+		REQUIRE(nvlist_exists(tags, "stay"));
+		fnvlist_free(tags);
+	}
+
+	/* Clear is idempotent. */
+	REQUIRE(zmetad_db_tag_clear(db, "tank/a", 7) == 0);
+	REQUIRE(zmetad_db_tag_get(db, "tank/a", 7, &tags) == 0);
+	REQUIRE(nvlist_empty(tags));
+	fnvlist_free(tags);
+	REQUIRE(zmetad_db_tag_clear(db, "tank/a", 7) == 0);
+
+	/* Purge removes the dataset's tags with everything else. */
+	{
+		long long counts[4] = { 0, 0, 0, 0 };
+		nvlist_t *ev = fnvlist_alloc();
+
+		tags = fnvlist_alloc();
+		fnvlist_add_string(tags, "k", "v");
+		REQUIRE(zmetad_db_tag_set(db, "tank/b", 9, tags) == 0);
+		fnvlist_free(tags);
+
+		fnvlist_add_uint64(ev, "txg", 102);
+		fnvlist_add_uint64(ev, "time", 1002);
+		fnvlist_add_uint64(ev, "object", 9);
+		fnvlist_add_uint16(ev, "op", 1);	/* CREATE */
+		REQUIRE(zmetad_db_insert_event(db, "tank/b", ev) == 0);
+		fnvlist_free(ev);
+
+		REQUIRE(zmetad_db_purge_dataset(db, "tank/b",
+		    counts) == 0);
+
+		REQUIRE(zmetad_db_tag_get(db, "tank/b", 9, &tags) == 0);
+		REQUIRE(nvlist_empty(tags));
+		fnvlist_free(tags);
+	}
+
+	/* Dataset isolation: tank/a's rows were never tank/b's. */
+	REQUIRE(zmetad_db_tag_get(db, "tank/a", 9, &tags) == 0);
+	REQUIRE(nvlist_empty(tags));
+	fnvlist_free(tags);
+
+	zmetad_db_close(db);
+	zmetad_schema_free(zs);
+	(void) unlink(path);
+	(void) rmdir(dir);
+}
+
 int
 main(void)
 {
@@ -1349,6 +1587,14 @@ main(void)
 
 	/* zmetad.conf parser (leaf 01). */
 	run_conf_tests();
+
+	/*
+	 * Database layer (issue #13 phase 1): tags table, tag-set
+	 * replace semantics and limits, REMOVE/purge lifetime
+	 * coupling.  Loads its own schema since the parser tests
+	 * freed theirs.
+	 */
+	run_db_tests();
 
 	if (g_fail) {
 		fprintf(stderr, "zmetad_schema_test: FAILED\n");
