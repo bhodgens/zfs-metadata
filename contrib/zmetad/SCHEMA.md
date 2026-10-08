@@ -1,10 +1,10 @@
-# zmetad database schema — consumer contract (layout version 8)
+# zmetad database schema — consumer contract (layout version 9)
 
 This document is the stable contract between the `zmetad` daemon's SQLite
 database (`zmetad.db`) and external consumers (e.g. zeta-object). It is
 written so a consumer can be implemented without reading `zmetad` source.
 Every column name, type, and semantic below is pinned to
-`contrib/zmetad/zmetad_db.c` at DB layout version 8.
+`contrib/zmetad/zmetad_db.c` at DB layout version 9.
 
 The database is opened in WAL mode (`PRAGMA journal_mode=WAL`); consumers
 may read concurrently with the daemon.
@@ -12,7 +12,7 @@ may read concurrently with the daemon.
 
 ## 1. Stability policy
 
-`meta.db_schema_version = 8` is the stable contract version documented
+`meta.db_schema_version = 9` is the stable contract version documented
 here.
 
 Evolution rules:
@@ -43,6 +43,7 @@ Version history:
 | 6 | sync_state gains `last_lost` (records_lost baseline; NULL = none yet) |
 | 7 | sync_state gains `root_id` (persisted dataset root object id; NULL = never learned) |
 | 8 | events gains `principal` (opaque application principal tag; NULL = writer did not register one) |
+| 9 | new `tags` table (S3-style object tags; issue #13) |
 
 Migration contract: upgrades are performed **in place** by zmetad with
 `ALTER TABLE ADD COLUMN`; added columns are NULL for pre-existing rows,
@@ -50,11 +51,14 @@ which is the correct representation of "field absent from those
 records". A failed-then-retried migration is safe ("duplicate column
 name" is treated as success). Consumers reading a v1/v2 database may
 apply the same column additions; consumers of a v3 database need no
-migration logic.
+migration logic. Layout 9 adds the `tags` table instead of a column:
+the table is created `IF NOT EXISTS` on every open, so its upgrade is
+the table's appearance plus the stamp — no ALTER, and no consumer-side
+migration logic for it either.
 
 Two version keys live in `meta` and are independent:
 
-- `db_schema_version` — the SQLite layout version (this document; `8`).
+- `db_schema_version` — the SQLite layout version (this document; `9`).
 - `events_schema_version` — the wire record schema version (`3`, see
   `contrib/zmetad/events-schema.json`; kept in lockstep with the
   kernel's `ZFS_EVENTS_VERSION`). The record schema evolves additively,
@@ -252,8 +256,8 @@ Row lifecycle:
 - Rows are **never deleted by retention** (`zmetad_db_cleanup` touches
   `events` only). They are therefore lifetime counts per dataset.
 - Rows are deleted **only** by `zmetad --purge <dataset>`, which removes
-  the dataset's `events`, `gaps`, `sync_state`, and `objmap` rows and
-  clears the kernel ring.
+  the dataset's `events`, `gaps`, `sync_state`, `objmap`, and `tags`
+  rows and clears the kernel ring.
 
 ### 2.6 `meta`
 
@@ -262,11 +266,73 @@ Row lifecycle:
 | key | TEXT | no | `PRIMARY KEY` |
 | value | TEXT | no | string value |
 
-Known keys: `db_schema_version` (`"8"`), `events_schema_version`
+Known keys: `db_schema_version` (`"9"`), `events_schema_version`
 (`"3"`), and `purge_epoch:<dataset>` (one monotonic integer per
 purged dataset; bumped atomically by `--purge`). The legacy global
 `purge_epoch` key survives in databases migrated from layout ≤ 6 but
 is no longer written.
+
+### 2.7 `tags`
+
+S3-style object tags: string:string key/value pairs a consumer attaches
+to an object it cares about. The rows are the consumer's application
+data — they are written through the tag CLI, not by event ingest, and
+carry no kernel-record semantics (unlike every `events` column, a tag
+is a claim the writer chose to store, not an observation the kernel
+reported).
+
+| Column | Type | NULL | Notes |
+|--------|------|------|-------|
+| dataset | TEXT | no | dataset name; part of the `PRIMARY KEY` |
+| object_id | INTEGER | no | object the tags belong to; part of the `PRIMARY KEY` |
+| key | TEXT | no | tag key; part of the `PRIMARY KEY` |
+| value | TEXT | no | tag value |
+| captured_at | INTEGER | no | unix seconds when the pair was written (the `events.captured_at` convention) |
+
+`PRIMARY KEY (dataset, object_id, key)`; index
+`idx_tags_dataset (dataset)` serves dataset-scoped lookups (tag get,
+`--purge`).
+
+**Replace-set semantics**: a set operation REPLACES the object's whole
+tag set — the stored rows are deleted and the new set inserted in one
+transaction, S3 `PutObjectTagging` style. It is never a merge: keys the
+new set drops are gone after a successful set, and there is no partial
+set operation.
+
+**Limits** (S3 object-tagging limits, enforced at the database layer,
+before the write transaction opens):
+
+- at most **10 tags** per object;
+- keys at most **128 characters**;
+- values at most **256 bytes**;
+- an empty key, a non-string value, or an **empty set** is rejected
+  (use tag clear to remove all tags).
+
+A rejected set is an `EINVAL` error and leaves the stored set
+**untouched** — the whole new set is validated before anything is
+written, so a set that exceeds a limit never leaves a partial update
+behind.
+
+**Reading**: tag get returns every stored pair for
+`(dataset, object_id)`. Zero pairs is an empty result, not an error —
+an object that was never tagged reads the same as a cleared one.
+
+**Clearing**: tag clear deletes all of the object's tag rows and is
+idempotent — clearing an object with no tags succeeds.
+
+**Lifetime**: tags are consumers' data, not event history, so they
+follow the object, not the record log:
+
+- a REMOVE event for the object deletes the object's tag rows in the
+  same batch transaction that inserts the event — object deletion and
+  its tags' deletion are one fact;
+- `zmetad --purge <dataset>` deletes the dataset's tag rows together
+  with its `events`/`gaps`/`sync_state`/`objmap` rows;
+- tags do **NOT** age out with retention: `zmetad_db_cleanup` touches
+  `events` only. S3 tags live until object deletion or an explicit
+  clear, so there is no retention clock on this table;
+- RENAME needs no action: `object_id` is stable across renames and the
+  tags key on `(dataset, object_id)`, never on the name.
 
 
 ## 3. Deduplication / insertion
@@ -425,7 +491,9 @@ on:
 
 The access pattern is a keyed, ordered, clamped scan, per dataset —
 plain SQL. This section documents an access pattern only: it has
-**no `db_schema_version` impact** and the layout stays 8.
+**no `db_schema_version` impact** and the layout stays at the version
+this document describes (the `tags` table of Section 2.7, layout 9,
+does not change the cursor's properties).
 
 ```sql
 SELECT ... FROM events
@@ -482,10 +550,10 @@ sound response.
   lifetime figures.
 - **`zmetad --purge <dataset>`** (one-shot mode: no daemonize, no poll
   loop): deletes the dataset's rows from `events`, `gaps`,
-  `sync_state`, **and `objmap`**, then clears the dataset's in-kernel
-  event ring and bumps the dataset's `purge_epoch:<dataset>` meta key
-  (atomically). Its report line prints the **events and gaps counts
-  only** (`purged <ds>: N events, M gaps removed; kernel ring
+  `sync_state`, `objmap`, **and `tags`**, then clears the dataset's
+  in-kernel event ring and bumps the dataset's `purge_epoch:<dataset>`
+  meta key (atomically). Its report line prints the **events and gaps
+  counts only** (`purged <ds>: N events, M gaps removed; kernel ring
   cleared`). This is the **only** mechanism that removes `gaps` rows.
   The `datasets` mapping row is left in place.
 - **Poll loop**: collects every `poll_interval` seconds (1-second sleep
