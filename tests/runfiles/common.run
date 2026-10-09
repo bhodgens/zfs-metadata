@@ -736,7 +736,8 @@ tests = ['dedup_bclone', 'dedup_bclone_pruned', 'dedup_fdt_create',
     'dedup_fdt_pacing', 'dedup_legacy_create', 'dedup_legacy_import',
     'dedup_legacy_fdt_upgrade', 'dedup_legacy_fdt_mixed', 'dedup_quota',
     'dedup_log_zdb_leak',
-    'dedup_prune', 'dedup_prune_leak', 'dedup_zap_shrink']
+    'dedup_prune', 'dedup_prune_leak', 'dedup_prune_percentage',
+    'dedup_zap_shrink']
 pre =
 post =
 tags = ['functional', 'dedup']
@@ -772,7 +773,8 @@ tests = ['failmode_dmu_tx_wait', 'failmode_dmu_tx_continue',
     'failmode_fsync_wait', 'failmode_fsync_continue',
     'failmode_msync_wait', 'failmode_msync_continue',
     'failmode_osync_wait', 'failmode_osync_continue',
-    'failmode_syncalways_wait', 'failmode_syncalways_continue']
+    'failmode_syncalways_wait', 'failmode_syncalways_continue',
+    'failmode_vdev_state']
 tags = ['functional', 'failmode']
 
 [tests/functional/fallocate]

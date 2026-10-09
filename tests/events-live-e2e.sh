@@ -44,7 +44,7 @@ DS="$TESTPOOL/$WORKDS"
 MNT=""
 DB="${ZMETAD_DB:-/var/lib/zfs/zmetad.db}"
 SUDO=()
-[ "$(id -u)" = "0" ] || SUDO=(sudo)
+[[ "$(id -u)" = "0" ]] || SUDO=(sudo)
 fail() {
 	echo "FAIL: $*"
 	exit 1
@@ -52,14 +52,14 @@ fail() {
 
 # shellcheck disable=SC2317  # EXIT/INT trap, invoked indirectly
 cleanup() {
-	[ -n "$MNT" ] && "${SUDO[@]}" "$ZFS" destroy -R "$DS" >/dev/null 2>&1
-	[ -n "$STOP_ZMETAD" ] && "${SUDO[@]}" pkill -f "$ZMETAD -i 1" \
+	[[ -n "$MNT" ]] && "${SUDO[@]}" "$ZFS" destroy -R "$DS" >/dev/null 2>&1
+	[[ -n "$STOP_ZMETAD" ]] && "${SUDO[@]}" pkill -f "$ZMETAD -i 1" \
 	    >/dev/null 2>&1
 }
 trap cleanup EXIT INT TERM
 
-[ -e "$ZMETAD" ] || fail "zmetad not found at $ZMETAD (set ZMETAD=)"
-[ -e "$ZFS" ] || fail "zfs not found at $ZFS (set ZFS=)"
+[[ -e "$ZMETAD" ]] || fail "zmetad not found at $ZMETAD (set ZMETAD=)"
+[[ -e "$ZFS" ]] || fail "zfs not found at $ZFS (set ZFS=)"
 
 "${SUDO[@]}" "$ZPOOL" get -H -o value feature@events "$TESTPOOL" \
     2>/dev/null | grep -q enabled \
@@ -71,7 +71,7 @@ MNT="$DS"
 "${SUDO[@]}" "$ZFS" set mountpoint=/tmp/"$WORKDS" "$DS" \
     2>/dev/null || true
 MNT="/tmp/$WORKDS"
-[ -d "$MNT" ] || fail "$DS mounted nowhere ($MNT missing)"
+[[ -d "$MNT" ]] || fail "$DS mounted nowhere ($MNT missing)"
 
 #
 # The DB must not carry pre-existing rows for this dataset name
@@ -104,7 +104,7 @@ wait "$ZPID" 2>/dev/null
 #
 OUT=$("${SUDO[@]}" "$ZMETAD" --query "$DS" -d "$DB")
 N=$(printf '%s\n' "$OUT" | grep -c .)
-[ "$N" -ge 5 ] || fail "expected >=5 events for $DS, got $N"
+[[ "$N" -ge 5 ]] || fail "expected >=5 events for $DS, got $N"
 printf '%s\n' "$OUT" | head -1 | python3 -c '
 import json, sys
 json.loads(sys.stdin.readline())
@@ -118,7 +118,7 @@ print(" ".join(str(i) for i in ids))
 ')
 ASC=$(printf '%s\n' "$IDS" | tr ' ' '\n' | sort -n | tr '\n' ' ')
 WANT=$(printf '%s\n' "$IDS" | tr ' ' '\n' | tr '\n' ' ')
-[ "$ASC" = "$WANT" ] || fail "live ids not ascending: $IDS"
+[[ "$ASC" = "$WANT" ]] || fail "live ids not ascending: $IDS"
 
 # Truncation honesty over live data.
 LAST1=$(printf '%s\n' "$IDS" | tr ' ' '\n' | sort -n | tail -1)
@@ -135,7 +135,7 @@ FIRST_R=$(printf '%s\n' "$RESUME" | head -1 | python3 -c '
 import json, sys
 print(json.loads(sys.stdin.readline())["id"])
 ')
-[ "$FIRST_R" -gt "$HINT" ] || fail "resume id $FIRST_R <= hint $HINT"
+[[ "$FIRST_R" -gt "$HINT" ]] || fail "resume id $FIRST_R <= hint $HINT"
 
 # Create something new AFTER a cursor was taken: since-id sees only
 # the increment (the true incremental-consumption pattern).
@@ -148,7 +148,7 @@ kill "$ZPID" 2>/dev/null
 wait "$ZPID" 2>/dev/null
 DELTA=$("${SUDO[@]}" "$ZMETAD" --query "$DS" --since-id "$LAST1" -d "$DB" \
     | grep -c .)
-[ "$DELTA" -ge 1 ] || fail "no new events visible after cursor $LAST1"
+[[ "$DELTA" -ge 1 ]] || fail "no new events visible after cursor $LAST1"
 
 echo "PASS cursor: $N live events, ascending, truncate+resume at $HINT, incremental delta $DELTA"
 
@@ -160,7 +160,7 @@ TAGOBJ=$("${SUDO[@]}" "$ZMETAD" --query "$DS" -d "$DB" | head -1 \
 import json, sys
 print(json.loads(sys.stdin.readline())["object_id"])
 ')
-[ -n "$TAGOBJ" ] || fail "could not read an object_id from live events"
+[[ -n "$TAGOBJ" ]] || fail "could not read an object_id from live events"
 
 "${SUDO[@]}" "$ZMETAD" --tag-set "$DS" --tag-object "$TAGOBJ" \
     --tag team=storage --tag env=prod -d "$DB" \
@@ -204,7 +204,7 @@ for line in sys.stdin:
         name_id["obj"] = r["object_id"]
 print(name_id.get("obj", ""))
 ')
-[ -n "$TOBJ" ] || fail "could not find CREATE event for tagged file"
+[[ -n "$TOBJ" ]] || fail "could not find CREATE event for tagged file"
 
 "${SUDO[@]}" "$ZMETAD" --tag-set "$DS" --tag-object "$TOBJ" \
     --tag keep=me -d "$DB" >/dev/null || fail "tagging tagged-file failed"
@@ -232,7 +232,7 @@ print("none" if not found else "")
 echo "$REMOVED" | grep -q "$TOBJ" \
     || fail "REMOVE for object $TOBJ not in live log: got [$REMOVED]"
 LEFT=$("${SUDO[@]}" "$ZMETAD" --tag-get "$DS" --tag-object "$TOBJ" -d "$DB")
-[ -z "$LEFT" ] || fail "tags survived REMOVE: $LEFT"
+[[ -z "$LEFT" ]] || fail "tags survived REMOVE: $LEFT"
 
 echo "PASS remove-coupling: object $TOBJ removed via VFS, tags gone"
 
@@ -244,9 +244,9 @@ echo "PASS remove-coupling: object $TOBJ removed via VFS, tags gone"
 "${SUDO[@]}" "$ZMETAD" --purge "$DS" -d "$DB" >/dev/null \
     || fail "purge failed"
 LEFTQ=$("${SUDO[@]}" "$ZMETAD" --query "$DS" -d "$DB" | grep -c .)
-[ "$LEFTQ" = "0" ] || fail "purge left events behind ($LEFTQ rows)"
+[[ "$LEFTQ" = "0" ]] || fail "purge left events behind ($LEFTQ rows)"
 LEFTT=$("${SUDO[@]}" "$ZMETAD" --tag-get "$DS" --tag-object "$TAGOBJ" -d "$DB")
-[ -z "$LEFTT" ] || fail "purge left tags behind: $LEFTT"
+[[ -z "$LEFTT" ]] || fail "purge left tags behind: $LEFTT"
 
 echo "PASS purge: dataset rows and tags both cleared"
 echo "LIVE E2E: ALL PASS"

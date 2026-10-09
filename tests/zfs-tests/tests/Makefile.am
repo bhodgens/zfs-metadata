@@ -1604,6 +1604,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/dedup/dedup_log_zdb_leak.ksh \
 	functional/dedup/dedup_prune.ksh \
 	functional/dedup/dedup_prune_leak.ksh \
+	functional/dedup/dedup_prune_percentage.ksh \
 	functional/dedup/dedup_quota.ksh \
 	functional/dedup/dedup_zap_shrink.ksh \
 	functional/dedup/setup.ksh \
@@ -1703,7 +1704,9 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/failmode/failmode_osync_continue.ksh \
 	functional/failmode/failmode_osync_wait.ksh \
 	functional/failmode/failmode_syncalways_continue.ksh \
+	functional/failmode/failmode_nowait_wait.ksh \
 	functional/failmode/failmode_syncalways_wait.ksh \
+	functional/failmode/failmode_vdev_state.ksh \
 	functional/failmode/setup.ksh \
 	functional/fallocate/cleanup.ksh \
 	functional/fallocate/fallocate_extend_timestamps.ksh \
